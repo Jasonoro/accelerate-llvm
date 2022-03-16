@@ -126,6 +126,27 @@ class Remote arch => Execute arch where
                 -> Delayed (Array (sh, Int) e)
                 -> Par arch (FutureR arch (Array (sh, Int) e, Array sh e))
 
+  segscan       :: IntegralType i
+                -> Direction
+                -> HasInitialValue
+                -> ArrayR (Array (sh, Int) e)
+                -> ExecutableR arch
+                -> Gamma aenv
+                -> ValR arch aenv
+                -> Delayed (Array (sh, Int) e)
+                -> Delayed (Segments i)
+                -> Par arch (FutureR arch (Array (sh, Int) e))
+
+  segscan'      :: IntegralType i
+                -> Direction
+                -> ArrayR (Array (sh, Int) e)
+                -> ExecutableR arch
+                -> Gamma aenv
+                -> ValR arch aenv
+                -> Delayed (Array (sh, Int) e)
+                -> Delayed (Segments i)
+                -> Par arch (FutureR arch (Array (sh, Int) e, Array sh e))
+
   permute       :: Bool                         -- ^ update defaults array in-place?
                 -> ArrayR (Array sh e)
                 -> ShapeR sh'
@@ -319,6 +340,9 @@ executeOpenAcc !topAcc !aenv = travA topAcc
         Scan d z a             -> exec1 (scan d z   $              arrayR a) (travD a)
         Scan' d a              -> splitPair
                                 $ exec1 (scan' d    $              arrayR a) (travD a)
+        SegScan i d z a s      -> exec2 (segscan i d z  $          arrayR a) (travD a) (travD s)
+        SegScan' i d a s       -> splitPair
+                                $ exec2 (segscan' i d   $          arrayR a) (travD a) (travD s)
         Permute d a            -> exec2 (permute_ d (arrayR a) $ arrayRshape $ arrayR d) (travA d) (travD a)
         Stencil1 tpB h a       -> let ArrayR shr tpA = arrayR a
                                   in  exec1 (stencil1 tpA (ArrayR shr tpB) h) (travD a)

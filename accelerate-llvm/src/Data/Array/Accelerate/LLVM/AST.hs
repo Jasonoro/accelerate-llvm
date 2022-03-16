@@ -148,6 +148,19 @@ data PreOpenAccSkeleton acc arch aenv a where
   Scan'       :: Direction
               -> DelayedOpenAcc     acc arch aenv (Array (sh, Int) e)
               -> PreOpenAccSkeleton acc arch aenv (Array (sh, Int) e, Array sh e)
+  
+  SegScan     :: IntegralType i
+              -> Direction
+              -> HasInitialValue
+              -> DelayedOpenAcc     acc arch aenv (Array (sh, Int) e)
+              -> DelayedOpenAcc     acc arch aenv (Segments i)
+              -> PreOpenAccSkeleton acc arch aenv (Array (sh, Int) e)
+  
+  SegScan'    :: IntegralType i
+              -> Direction
+              -> DelayedOpenAcc     acc arch aenv (Array (sh, Int) e)
+              -> DelayedOpenAcc     acc arch aenv (Segments i)
+              -> PreOpenAccSkeleton acc arch aenv (Array (sh, Int) e, Array sh e)
 
   Permute     :: acc                    arch aenv (Array sh' e)     -- target array (default values)
               -> DelayedOpenAcc     acc arch aenv (Array sh  e)     -- source values
@@ -227,6 +240,9 @@ instance HasArraysR (acc arch) => HasArraysR (PreOpenAccSkeleton acc arch) where
   arraysR (FoldSeg _ _ a _)        = arraysR a
   arraysR (Scan _ _ a)             = arraysR a
   arraysR (Scan' _ a)              = let ArrayR (ShapeRsnoc shr) tp = arrayR a
+                                     in  TupRsingle (ArrayR (ShapeRsnoc shr) tp) `TupRpair` TupRsingle (ArrayR shr tp)
+  arraysR (SegScan _ _ _ a _)      = arraysR a
+  arraysR (SegScan' _ _ a _ )      = let ArrayR (ShapeRsnoc shr) tp = arrayR a
                                      in  TupRsingle (ArrayR (ShapeRsnoc shr) tp) `TupRpair` TupRsingle (ArrayR shr tp)
   arraysR (Permute a _)            = arraysR a
   arraysR (Stencil1 tp _ a)        = let ArrayR shr _ = arrayR a

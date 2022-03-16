@@ -210,6 +210,8 @@ liftPreOpenAccSkeleton arch pacc =
     FoldSeg i z a s      -> [|| FoldSeg $$(liftIntegralType i) $$(liftZ z) $$(liftD a) $$(liftD s) ||]
     Scan d z a           -> [|| Scan $$(liftDir d) $$(liftZ z) $$(liftD a) ||]
     Scan' d a            -> [|| Scan' $$(liftDir d) $$(liftD a) ||]
+    SegScan i d z a s    -> [|| SegScan $$(liftIntegralType i) $$(liftDir d) $$(liftZ z) $$(liftD a) $$(liftD s) ||]
+    SegScan' i d a s     -> [|| SegScan' $$(liftIntegralType i) $$(liftDir d) $$(liftD a) $$(liftD s) ||]
     Permute d a          -> [|| Permute $$(liftA d) $$(liftD a) ||]
     Stencil1 tp h a      -> [|| Stencil1 $$(liftTypeR tp) $$(liftS (arrayRshape $ arrayR a) h) $$(liftD a) ||]
     Stencil2 tp h a b    -> [|| Stencil2 $$(liftTypeR tp) $$(liftS (arrayRshape $ arrayR a) h) $$(liftD a) $$(liftD b) ||]

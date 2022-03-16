@@ -91,6 +91,8 @@ instance Execute PTX where
   {-# INLINE foldSeg     #-}
   {-# INLINE scan        #-}
   {-# INLINE scan'       #-}
+  {-# INLINE segscan     #-}
+  {-# INLINE segscan'    #-}
   {-# INLINE permute     #-}
   {-# INLINE stencil1    #-}
   {-# INLINE stencil2    #-}
@@ -105,6 +107,9 @@ instance Execute PTX where
   scan _ True   = scanOp
   scan _ False  = scan1Op
   scan' _       = scan'Op
+  segscan i _ True  = segscanOp i
+  segscan i _ False = segscan1Op i
+  segscan' i _      = segscan'Op i
   permute       = permuteOp
   stencil1      = stencil1Op
   stencil2      = stencil2Op
@@ -589,6 +594,117 @@ scan'DimOp repr@(ArrayR (ShapeRsnoc shr') _) exe gamma aenv input@(delayedShape 
     put future (result, sums)
     return future
 
+{-# INLINE segscanOp #-}
+segscanOp
+    :: HasCallStack
+    => IntegralType i
+    -> ArrayR (Array (sh, Int) e)
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Delayed (Array (sh, Int) e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Array (sh, Int) e))
+segscanOp intTp repr exe gamma aenv input@(delayedShape -> (sz, n)) seg =
+  case n of
+    0 -> generateOp repr exe gamma aenv (sz, 1)
+    _ -> segscanCore intTp repr exe gamma aenv (n+1) input seg
+
+{-# INLINE segscanCore #-}
+segscanCore
+    :: HasCallStack
+    => IntegralType i
+    -> ArrayR (Array (sh, Int) e)
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Int                    -- output size of innermost dimension
+    -> Delayed (Array (sh, Int) e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Array (sh, Int) e))
+segscanCore intTp repr exe gamma aenv m input seg
+  | ArrayR (ShapeRsnoc ShapeRz) tp <- repr
+  = segscanAllOp intTp tp exe gamma aenv m input seg
+  | otherwise
+  = segscanDimOp intTp repr exe gamma aenv m input seg
+
+{-# INLINE segscanAllOp #-}
+segscanAllOp
+    :: HasCallStack
+    => IntegralType i
+    -> TypeR e
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Int                    -- output size
+    -> Delayed (Vector e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Vector e))
+segscanAllOp intTp tp exe gamma aenv m input@(delayedShape -> ((), n)) seg@(delayedShape -> ((), ss)) =
+  withExecutable exe $ \ptxExecutable -> do
+    let k1 = ptxExecutable !# "segscanAll"
+    let s = n `multipleOf` (kernelThreadBlockSize k1)
+    let repr =  ArrayR dim1 tp
+    let reprSeg = ArrayR dim1 $ TupRsingle $ SingleScalarType $ NumSingleType $ IntegralNumType intTp
+    let ArrayR (ShapeRsnoc shr') _ = repr
+    future  <- new
+    result  <- allocateRemote repr ((), m)
+    let paramsR = TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray reprSeg)
+    executeOp k1 gamma aenv dim1 ((), s) paramsR ((result, manifest input), manifest seg)
+    put future result
+    return future
+
+{-# INLINE segscanDimOp #-}
+segscanDimOp
+    :: HasCallStack
+    => IntegralType i
+    -> ArrayR (Array (sh, Int) e)
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Int
+    -> Delayed (Array (sh, Int) e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Array (sh, Int) e))
+segscanDimOp intTp repr exe gamma aenv m input@(delayedShape -> (sz, _)) seg =
+  withExecutable exe $ \ptxExecutable -> do
+    let ArrayR (ShapeRsnoc shr') _ = repr
+    future  <- new
+    result  <- allocateRemote repr (sz, m)
+    let paramsR = TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+    executeOp (ptxExecutable !# "segscan") gamma aenv dim1 ((), size shr' sz) paramsR (result, manifest input)
+    put future result
+    return future
+
+-- Has no initial value
+{-# INLINE segscan1Op #-}
+segscan1Op
+    :: HasCallStack
+    => IntegralType i
+    -> ArrayR (Array (sh, Int) e)
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Delayed (Array (sh, Int) e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Array (sh, Int) e))
+segscan1Op intTp repr exe gamma aenv input@(delayedShape -> sh@(_, n)) seg =
+  case n of
+    0 -> newFull =<< allocateRemote repr sh
+    _ -> segscanCore intTp repr exe gamma aenv n input seg
+
+{-# INLINE segscan'Op #-}
+segscan'Op
+    :: HasCallStack
+    => IntegralType i
+    -> ArrayR (Array (sh, Int) e)
+    -> ExecutableR PTX
+    -> Gamma aenv
+    -> Val aenv
+    -> Delayed (Array (sh, Int) e)
+    -> Delayed (Segments i)
+    -> Par PTX (Future (Array (sh, Int) e, Array sh e))
+segscan'Op intTp repr exe gamma aenv input@(delayedShape -> (sz, n)) seg = undefined
 
 {-# INLINE permuteOp #-}
 permuteOp
@@ -799,8 +915,8 @@ aforeignOp name _ _ asm arr = do
   $ lookupKernel name exe
 
 lookupKernel :: ShortByteString -> FunctionTable -> Maybe Kernel
-lookupKernel name ptxExecutable =
-  find (\k -> let n = kernelName k in S.take (S.length n - 65) n == name) (functionTable ptxExecutable)
+lookupKernel name ptxExecutable = 
+    find (\k -> let n = kernelName k in S.take (S.length n - 65) n == name) (functionTable ptxExecutable)
 
 delayedShape :: Delayed (Array sh e) -> sh
 delayedShape (Delayed sh) = sh

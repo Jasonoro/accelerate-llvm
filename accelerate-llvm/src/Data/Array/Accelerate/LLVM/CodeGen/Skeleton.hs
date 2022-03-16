@@ -43,6 +43,7 @@ class Skeleton arch where
   {-# MINIMAL generate, transform
             , fold , foldSeg
             , scan, scan'
+            , segscan, segscan'
             , permute
             , stencil1, stencil2 #-}
 
@@ -101,6 +102,28 @@ class Skeleton arch where
                 -> IRFun2     arch aenv (e -> e -> e)
                 -> IRExp      arch aenv e
                 -> MIRDelayed arch aenv (Array (sh, Int) e)
+                -> CodeGen    arch      (IROpenAcc arch aenv (Array (sh, Int) e, Array sh e))
+
+  segscan       :: UID
+                -> Gamma           aenv
+                -> ArrayR               (Array (sh, Int) e)
+                -> IntegralType i
+                -> Direction
+                -> IRFun2     arch aenv (e -> e -> e)
+                -> Maybe (IRExp arch aenv e)
+                -> MIRDelayed arch aenv (Array (sh, Int) e)
+                -> MIRDelayed arch aenv (Segments i)
+                -> CodeGen    arch      (IROpenAcc arch aenv (Array (sh, Int) e))
+
+  segscan'      :: UID
+                -> Gamma           aenv
+                -> ArrayR               (Array (sh, Int) e)
+                -> IntegralType i
+                -> Direction
+                -> IRFun2     arch aenv (e -> e -> e)
+                -> IRExp arch aenv e
+                -> MIRDelayed arch aenv (Array (sh, Int) e)
+                -> MIRDelayed arch aenv (Segments i)
                 -> CodeGen    arch      (IROpenAcc arch aenv (Array (sh, Int) e, Array sh e))
 
   permute       :: UID

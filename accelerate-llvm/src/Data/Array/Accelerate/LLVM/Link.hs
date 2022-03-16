@@ -137,6 +137,8 @@ linkOpenAcc = travA
         FoldSeg i z a s         -> FoldSeg i z     <$> travD a <*> travD s
         Scan d z a              -> Scan d z        <$> travD a
         Scan' d a               -> Scan' d         <$> travD a
+        SegScan i d z a s       -> SegScan i d z   <$> travD a <*> travD s
+        SegScan' i d a s        -> SegScan' i d    <$> travD a <*> travD s
         Permute d a             -> Permute         <$> travA d <*> travD a
         Stencil1 tp h a         -> Stencil1 tp h   <$> travD a
         Stencil2 tp h a b       -> Stencil2 tp h   <$> travD a <*> travD b

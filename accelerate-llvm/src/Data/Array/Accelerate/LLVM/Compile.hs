@@ -179,6 +179,8 @@ compileOpenAcc = traverseAcc
         FoldSeg i f z a s           -> build =<< liftA4 (foldSeg i)   <$> travF f <*> travME z <*> travD a <*> travD s
         Scan  d f z a               -> build =<< liftA3 (scan  d)     <$> travF f <*> travME z <*> travD a
         Scan' d f z a               -> build =<< liftA3 (scan' d)     <$> travF f <*> travE z <*> travD a
+        SegScan i d f z a s         -> build =<< liftA4 (segscan i d) <$> travF f <*> travME z <*> travD a <*> travD s
+        SegScan' i d f z a s        -> build =<< liftA4 (segscan' i d)  <$> travF f <*> travE z <*> travD a <*> travD s
         Permute f d g a             -> build =<< liftA4 permute       <$> travF f <*> travA d <*> travF g <*> travD a
         Stencil s tp f x a          -> build =<< liftA3 (stencil1 s tp) <$> travF f <*> travB x <*> travD a
         Stencil2 s1 s2 tp f x a y b -> build =<< liftA5 (stencil2 s1 s2 tp) <$> travF f <*> travB x <*> travD a <*> travB y <*> travD b
@@ -197,6 +199,8 @@ compileOpenAcc = traverseAcc
         foldSeg i _ z a s      = AST.FoldSeg i z a s
         scan d _ z a           = AST.Scan d z a
         scan' d _ _ a          = AST.Scan' d a
+        segscan i d _ z a s    = AST.SegScan i d z a s
+        segscan' i d _ _ a s   = AST.SegScan' i d a s 
         permute _ d _ a        = AST.Permute d a
 
         stencil1 :: StencilR sh a stencil

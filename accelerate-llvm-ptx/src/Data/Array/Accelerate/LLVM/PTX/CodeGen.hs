@@ -26,6 +26,7 @@ import Data.Array.Accelerate.LLVM.PTX.CodeGen.Intrinsic ()
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Map
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Permute
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Scan
+import Data.Array.Accelerate.LLVM.PTX.CodeGen.Segscan
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Stencil
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Transform
 import Data.Array.Accelerate.LLVM.PTX.Target
@@ -39,6 +40,8 @@ instance Skeleton PTX where
   foldSeg     = mkFoldSeg
   scan        = mkScan
   scan'       = mkScan'
+  segscan     = mkSegscan
+  segscan'    = mkSegscan'
   permute     = mkPermute
   stencil1    = mkStencil1
   stencil2    = mkStencil2
