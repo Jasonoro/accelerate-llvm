@@ -39,6 +39,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
+import Data.Array.Accelerate.LLVM.CodeGen.Ptr
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.Compile.Cache
 import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
@@ -46,7 +47,13 @@ import Data.Array.Accelerate.LLVM.PTX.CodeGen.Base
 import Data.Array.Accelerate.LLVM.PTX.CodeGen.Generate
 import Data.Array.Accelerate.LLVM.PTX.Target
 
+
+import LLVM.AST.Type.AddrSpace
+import LLVM.AST.Type.Instruction
+import LLVM.AST.Type.Instruction.Atomic
+import LLVM.AST.Type.Instruction.Volatile
 import LLVM.AST.Type.Representation
+import qualified LLVM.AST.Type.Instruction.RMW                      as RMW
 
 import qualified Foreign.CUDA.Analysis                              as CUDA
 import qualified Debug.Trace                                        as DT
@@ -123,7 +130,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
         ws        = CUDA.warpSize dev
         warps     = n `P.quot` ws
         per_warp  = ws + ws `P.quot` 2
-        bytes     = bytesElt tp
+        bytes     = bytesElt tp + bytesElt (TupRsingle scalarTypeInt32)
   --
   makeOpenAccWith config uid "segscanAll" (paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
     -- Size of the input array
@@ -1501,19 +1508,18 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
     int32 :: Integral a => a -> Operands Int32
     int32 = liftInt32 . P.fromIntegral
 
-    -- Temporary storage required for each warp
-    -- warp_smem_elems = CUDA.warpSize dev + (CUDA.warpSize dev `P.quot` 2)
-    -- warp_smem_bytes = warp_smem_elems  * bytesElt tp
-
     -- Step 1: Scan in every warp
     warpScan :: Operands e -> CodeGen PTX (Operands e)
-    warpScan e = segscanWarpShfl dir dev tp intTy combine e nflag
+    warpScan e = do 
+      fFlag <- A.fromIntegral intTy numType nflag
+      segscanWarpShfl dir dev tp combine e fFlag
 
     -- Step 2: Collect the aggregate results of each warp to compute the prefix
     -- values for each warp and combine with the partial result to compute each
     -- thread's final value.
     warpPrefix :: Operands e -> CodeGen PTX (Operands e)
     warpPrefix input = do
+      fFlag <- A.fromIntegral intTy numType nflag
       -- Allocate #warps elements of shared memory
       bd    <- blockDim
       warps <- A.quot integralType bd (int32 (CUDA.warpSize dev))
@@ -1522,10 +1528,34 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       -- Share warp aggregates
       wid   <- warpId
       lane  <- laneId
-      when (A.eq singleType lane (int32 (CUDA.warpSize dev - 1))) $ do
+      when (A.eq singleType lane (int32 $ CUDA.warpSize dev - 1)) $ do
         writeArray TypeInt32 smem wid input
+      
+      -- We want to find out for each warp, at which index the first reset
+      -- happens due to a flag. This is because after this flag, we should
+      -- not incorporate the prefix into the elements. As such, create
+      -- a shared array for these values
+      skip <- A.mul numType warps $ liftInt32 $ P.fromIntegral $ bytesElt tp `P.quot` 2
+      sflags <- dynamicSharedMem (TupRsingle scalarTypeInt32) TypeInt32 (liftInt32 0) skip
 
-      -- Wait for each warp to finish its local scan and share the aggregate
+      -- Set the value of the last flag to the warpSize, so that the `min` function later can reduce this value
+      -- to the first lane that has a flag. If the value stays the same as the warp size, we know
+      -- that there is no flag. Lane 0 sets this value, as Lane (warpSize - 1) might have stopped already
+      -- because the last block could have less elements than the block size
+      -- Finding that bug took like 3 hours...
+      when (A.eq singleType lane (int32 $ (0 :: Int32))) $ do
+        writeArray TypeInt32 sflags wid $ int32 $ CUDA.warpSize dev
+      
+      -- Make sure that each warps has finished its local scan and its first flag, and it has shared this with
+      -- the other threads in the block.
+      __syncthreads
+
+      -- Grab a pointer to the shared flags array, with index the current warp id. Needed to perform the atomic operation
+      ptr <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData sflags))) [op integralType wid]
+      when (A.gt singleType fFlag (liftInt 0)) $ do
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType lane) (CrossThread, AcquireRelease)
+
+      -- Wait for each warp to finish its atomic operations and share that info
       __syncthreads
 
       -- Compute the prefix value for this warp and add to the partial result.
@@ -1544,27 +1574,41 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
           p0     <- readArray TypeInt32 smem (liftInt32 0)
           prefix <- iterFromStepTo tp (liftInt32 1) (liftInt32 1) steps p0 $ \step x -> do
                       y <- readArray TypeInt32 smem step
-                      case dir of
-                        LeftToRight -> app2 combine x y
-                        RightToLeft -> app2 combine y x
+                      flag <- readArray TypeInt32 sflags step
+                      -- If there is no flag in the warp we look at (reprented by the value of warp size),
+                      -- we add that warps prefix. If there was a flag, any values before that warp don't matter
+                      -- anymore.
+                      if (tp, A.eq singleType flag (int32 (CUDA.warpSize dev)))
+                        then do
+                          case dir of
+                            LeftToRight -> app2 combine x y
+                            RightToLeft -> app2 combine y x
+                        else
+                          return y
 
-          case dir of
-            LeftToRight -> app2 combine prefix input
-            RightToLeft -> app2 combine input prefix
+          -- Now check if we actually should incorporate the prefix values.
+          -- This should happen for all lanes before the first flag, because after the first flag
+          -- the prefix doesn't matter anymore
+          sflagel <- readArray TypeInt32 sflags wid
+          if (tp, A.lt singleType lane sflagel)
+            then do
+              case dir of
+                LeftToRight -> app2 combine prefix input
+                RightToLeft -> app2 combine input prefix
+            else 
+              return input
 
 segscanWarpShfl
-    :: forall aenv e i.
+    :: forall aenv e.
        Direction
     -> DeviceProperties                             -- ^ properties of the target device
     -> TypeR e
-    -> IntegralType i
     -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
     -> Operands e                                   -- ^ calling thread's input element
-    -> Operands i
+    -> Operands Int
     -> CodeGen PTX (Operands e)
-segscanWarpShfl dir dev tp intTy combine el flag = do
-  fInt <- A.fromIntegral intTy numType flag
-  scan 0 el fInt
+segscanWarpShfl dir dev tp combine el flag = do
+  scan 0 el flag
   ---
   where
     log2 :: Double -> Double
