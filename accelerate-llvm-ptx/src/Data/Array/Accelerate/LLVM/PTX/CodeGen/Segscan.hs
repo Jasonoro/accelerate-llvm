@@ -1535,7 +1535,7 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       -- happens due to a flag. This is because after this flag, we should
       -- not incorporate the prefix into the elements. As such, create
       -- a shared array for these values
-      skip <- A.mul numType warps $ liftInt32 $ P.fromIntegral $ bytesElt tp `P.quot` 2
+      skip <- A.mul numType warps $ liftInt32 $ P.fromIntegral $ bytesElt tp
       sflags <- dynamicSharedMem (TupRsingle scalarTypeInt32) TypeInt32 (liftInt32 0) skip
 
       -- Set the value of the last flag to the warpSize, so that the `min` function later can reduce this value
