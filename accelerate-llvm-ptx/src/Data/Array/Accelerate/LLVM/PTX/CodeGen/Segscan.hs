@@ -125,177 +125,186 @@ mkSegscanAll
 mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running mkSegscanAll..." $ do
   dev <- liftCodeGen $ gets ptxDeviceProperties
   let
+    (arrBlockId, paramBlockId) = mutableArray (ArrayR dim1 (TupRsingle scalarTypeInt)) "blockIdArr"
     (arrTmp, paramTmp)  = mutableArray (ArrayR dim1 tmpTp) "tmp"
     (arrOut, paramOut) = mutableArray (ArrayR dim1 tp) "out"
     (arrIn, paramIn) = delayedArray "in" marr
     (arrSeg, paramSeg) = delayedArray "seg" mseg
     end = indexHead (irArrayShape arrOut)
     paramEnv = envParam aenv
-    config = launchConfig dev (CUDA.incWarp dev) smem const [|| const ||]
+    config = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||]
     tmpTp = TupRsingle scalarTypeInt32 `TupRpair` tp
     smem n
-      | canShfl dev     = warps * bytes + 8 -- Need eight bytes to save if there was a flag - TODO: Reduce to 1
-      | otherwise       = warps * (1 + per_warp) * bytes + 8
+      | canShfl dev     = warps * bytes + 16 -- Need eight bytes to save if there was a flag, and 8 to save the incremental counter - TODO: Reduce to 1 per
+      | otherwise       = warps * (1 + per_warp) * bytes + 16
       where
         ws        = CUDA.warpSize dev
         warps     = n `P.quot` ws
         per_warp  = ws + ws `P.quot` 2
         bytes     = bytesElt tp + bytesElt (TupRsingle scalarTypeInt32)
   --
-  makeOpenAccWith config uid "segscanAll" (paramTmp ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
+  makeOpenAccWith config uid "segscanAll" (paramBlockId ++ paramTmp ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
     -- Size of the input array
     sz  <- indexHead <$> delayedExtent arrIn
+    bd <- blockDim
+    bd' <- int bd
+    tid <- threadIdx
+    tid' <- int tid
     
-    -- TODO: Use globally increasing value for this
-    bid <- blockIdx
-    s0  <- int bid
+    blockIdShared <- dynamicSharedMem (TupRsingle scalarTypeInt) TypeInt (liftInt 1) (liftInt 0)
+    last <- A.sub numType bd (liftInt32 1)
+    when (A.eq singleType tid last) $ do
+      bIdPtr <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData arrBlockId))) [op integralType (liftInt 0)]
+      bidT    <- instr' $ AtomicRMW (IntegralNumType TypeInt) NonVolatile RMW.Add bIdPtr (op integralType (liftInt 1)) (CrossThread, AcquireRelease)
+      writeArray TypeInt blockIdShared (liftInt 0) (ir integralType bidT)
+    
+    __syncthreads
+    s0  <- readArray TypeInt blockIdShared (liftInt 0)
     gd  <- gridDim
     gd' <- int gd
+    -- Start by setting the values in global memory
+    when (A.eq singleType tid last) $ do
+      writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_initialized) (undefT tp))
+    bd <- blockDim
+    bd' <- int bd
+    -- Index this thread block starts at
+    inf <- A.mul numType s0 bd'
 
-    imapFromStepTo s0 gd' end $ \chunk -> do
-      -- Start by setting the values in global memory
-      writeArray TypeInt arrTmp chunk (A.pair (liftInt32 scan_initialized) (undefT tp))
-      bd <- blockDim
-      bd' <- int bd
-      -- Index this thread block starts at
-      inf <- A.mul numType chunk bd'
+    -- index i0 is the index this thread will read from
+    i0 <- case dir of
+            LeftToRight -> A.add numType inf tid'
+            RightToLeft -> do x <- A.sub numType sz inf
+                              y <- A.sub numType x tid'
+                              z <- A.sub numType y (liftInt 1)
+                              return z
+    
+    -- index j* is the index that we write to. Recall that for exclusive scans
+    -- the output array is one larger than the input; the initial element will
+    -- be written into this spot by thread 0 of the first thread block.
+    j0    <- case mseed of
+                Nothing -> return i0
+                Just _  -> case dir of
+                            LeftToRight -> A.add numType i0 (liftInt 1)
+                            RightToLeft -> return i0
 
-      -- index i0 is the index this thread will read from
-      tid <- threadIdx
-      tid' <- int tid
-      i0 <- case dir of
-              LeftToRight -> A.add numType inf tid'
-              RightToLeft -> do x <- A.sub numType sz inf
-                                y <- A.sub numType x tid'
-                                z <- A.sub numType y (liftInt 1)
-                                return z
+    -- If this thread has input, read data and participate in thread-block scan
+    let valid i = case dir of
+                    LeftToRight -> A.lt  singleType i sz
+                    RightToLeft -> A.gte singleType i (liftInt 0)
+
+    when (valid i0) $ do
+      x0 <- app1 (delayedLinearIndex arrIn) i0
+      f0 <- app1 (delayedLinearIndex arrSeg) i0
+      x1 <- case mseed of
+              Nothing   -> return x0
+              Just seed ->
+                if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType s0 (liftInt 0))
+                  then do
+                    z <- seed
+                    case dir of
+                      LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x0
+                      RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x0 z
+                  else
+                    return x0
+
+      n  <- A.sub numType sz inf
+      n' <- i32 n
+      x2 <- if (tp `TupRpair` TupRsingle scalarTypeInt32, A.gte singleType n bd')
+              then segscanBlock dir dev tp intTy combine Nothing   x1 f0
+              else segscanBlock dir dev tp intTy combine (Just n') x1 f0
+
+
+      -- We now have done block-level scans, so now we need to incorportate previous block(s) into
+      -- our application. Communication is done over global memory
+      let hadFlag = A.neq singleType (A.snd x2) (liftInt32 maxBound)
+      let isFirstBlock = A.eq singleType s0 (liftInt 0)
+      status <- if (TupRsingle scalarTypeInt32, hadFlag `lor'` isFirstBlock)
+                  then return (liftInt32 scan_inclusive_known)
+                  else return (liftInt32 scan_exclusive_known)
+
+      -- The last thread also writes its result---the aggregate for this
+      -- thread block, and it's corresponding status---to the temporary array. This is only
+      -- necessary for full blocks in a multi-block scan; the final
+      -- partially-full tile does not have a successor block.
+      last <- A.sub numType bd (liftInt32 1)
+      when (A.eq singleType tid last) $
+        writeArray TypeInt arrTmp s0 (A.pair status (A.fst x2))
       
-      -- index j* is the index that we write to. Recall that for exclusive scans
-      -- the output array is one larger than the input; the initial element will
-      -- be written into this spot by thread 0 of the first thread block.
-      j0    <- case mseed of
-                 Nothing -> return i0
-                 Just _  -> case dir of
-                              LeftToRight -> A.add numType i0 (liftInt 1)
-                              RightToLeft -> return i0
+      -- Threadfence so that the reads and writes are not out-of-order
+      __threadfence_grid
 
-      -- If this thread has input, read data and participate in thread-block scan
-      let valid i = case dir of
-                      LeftToRight -> A.lt  singleType i sz
-                      RightToLeft -> A.gte singleType i (liftInt 0)
+      -- Function to deconstruct the tuple in the while loop
+      let unPair3 e = let (e', z) = A.unpair e
+                          (x, y)  = A.unpair e'
+                          in (x, y, z)
+      let pair3 x y z = A.pair (A.pair x y) z
+      lookAtBlock <- A.sub numType s0 (liftInt 1)
+      -- We now need to incorporate the previous value up until our first flag.
+      let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
+      res <- if (tp, A.gt singleType s0 (liftInt 0))
+        then do
+          r <- while (whileTp) 
+                (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
+                (\(unPair3 -> (done,blockId,agg)) -> do
+                          previousBlock <- readArray TypeInt arrTmp blockId
+                          let (status, prevAgg) = A.unpair previousBlock
+                          statusIsInit      <- A.eq singleType status (liftInt32 scan_initialized)
+                          statusIsExclusive <- A.eq singleType status (liftInt32 scan_exclusive_known)
+                          statusIsInclusive <- A.eq singleType status (liftInt32 scan_inclusive_known)
+                          let allThreadsInit      = __all_sync (liftWord32 maxBound) statusIsInit
+                          let allThreadsExclusive = __all_sync (liftWord32 maxBound) statusIsExclusive
+                          let allThreadsInclusvie = __all_sync (liftWord32 maxBound) statusIsInclusive
+                          if (whileTp, allThreadsInit)
+                            -- The previous block is only initialized, so look again from the beginning
+                            then return $ pair3 done lookAtBlock (undefT tp)
+                            else do
+                              if (whileTp, allThreadsExclusive)
+                                -- The previous thread has an exclusive prefix. Add that exclusive prefix to our running
+                                -- prefix. If we don't have a current prefix, then set that. Also check if we can actually
+                                -- look back another block. If not, look again from the beginning
+                                then do
+                                  -- Can we look back another block?
+                                  if (whileTp, A.gt singleType blockId (liftInt 0))
+                                    then do
+                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                        then return prevAgg
+                                                        -- TODO: Both combine ways
+                                                        else app2 combine prevAgg agg
+                                      prevBlock <- A.sub numType blockId (liftInt 1)
+                                      return $ pair3 done prevBlock newAggregate
+                                    -- Cannot look back, so reset
+                                    else return $ pair3 done lookAtBlock (undefT tp)
+                                -- Not exclusive, so 2 possibilities left: inclusive or non-synced threads
+                                else do
+                                  if (whileTp, allThreadsInclusvie)
+                                    -- We have an inclusive prefix, add it and stop
+                                    then do
+                                      -- Make sure no undefined behaviour happends due to `agg` being undef
+                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                        then return prevAgg
+                                                        -- TODO: Both combine ways
+                                                        else app2 combine prevAgg agg
+                                      return $ pair3 (liftInt32 1) blockId newAggregate
+                                    -- If threads aren't synced, reset
+                                    else return $ pair3 done lookAtBlock (undefT tp)
+                )
+                (pair3 (liftInt32 0) lookAtBlock (undefT tp))
+          let (_, _, aggregateToAdd) = unPair3 r
+          if (tp, A.lt singleType tid (A.snd x2))
+            then do
+              case dir of
+                LeftToRight -> app2 combine aggregateToAdd (A.fst x2)
+                RightToLeft -> app2 combine (A.fst x2) aggregateToAdd
+            else do
+              return $ A.fst x2
+        else return $ A.fst x2
 
-      when (valid i0) $ do
-        x0 <- app1 (delayedLinearIndex arrIn) i0
-        f0 <- app1 (delayedLinearIndex arrSeg) i0
-        x1 <- case mseed of
-                Nothing   -> return x0
-                Just seed ->
-                  if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType chunk (liftInt 0))
-                    then do
-                      z <- seed
-                      case dir of
-                        LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x0
-                        RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x0 z
-                    else
-                      return x0
-
-        n  <- A.sub numType sz inf
-        n' <- i32 n
-        x2 <- if (tp `TupRpair` TupRsingle scalarTypeInt32, A.gte singleType n bd')
-                then segscanBlock dir dev tp intTy combine Nothing   x1 f0
-                else segscanBlock dir dev tp intTy combine (Just n') x1 f0
-
-
-        -- We now have done block-level scans, so now we need to incorportate previous block(s) into
-        -- our application. Communication is done over global memory
-        let hadFlag = A.neq singleType (A.snd x2) (liftInt32 maxBound)
-        let isFirstBlock = A.eq singleType chunk (liftInt 0)
-        status <- if (TupRsingle scalarTypeInt32, hadFlag `lor'` isFirstBlock)
-                    then return (liftInt32 scan_inclusive_known)
-                    else return (liftInt32 scan_exclusive_known)
-
-        -- The last thread also writes its result---the aggregate for this
-        -- thread block, and it's corresponding status---to the temporary array. This is only
-        -- necessary for full blocks in a multi-block scan; the final
-        -- partially-full tile does not have a successor block.
-        last <- A.sub numType bd (liftInt32 1)
+      writeArray TypeInt arrOut j0 res
+      -- If we only set an exclusive status, we now need to set the inclusive status.
+      when (A.eq singleType status (liftInt32 scan_exclusive_known)) $
         when (A.eq singleType tid last) $
-          writeArray TypeInt arrTmp chunk (A.pair status (A.fst x2))
-        
-        -- Threadfence so that the writes and writes are not out-of-order
-        __threadfence_grid
+          writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_inclusive_known) res)
 
-        -- Function to deconstruct the tuple in the while loop
-        let unPair3 e = let (e', z) = A.unpair e
-                            (x, y)  = A.unpair e'
-                            in (x, y, z)
-        let pair3 x y z = A.pair (A.pair x y) z
-        lookAtBlock <- A.sub numType chunk (liftInt 1)
-        -- We now need to incorporate the previous value up until our first flag.
-        let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
-        res <- if (tp, A.gt singleType chunk (liftInt 0))
-          then do
-            r <- while (whileTp) 
-                  (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
-                  (\(unPair3 -> (done,blockId,agg)) -> do
-                            previousBlock <- readArray TypeInt arrTmp blockId
-                            let (status, prevAgg) = A.unpair previousBlock
-                            statusIsInit      <- A.eq singleType status (liftInt32 scan_initialized)
-                            statusIsExclusive <- A.eq singleType status (liftInt32 scan_exclusive_known)
-                            statusIsInclusive <- A.eq singleType status (liftInt32 scan_inclusive_known)
-                            let allThreadsInit      = __all_sync (liftWord32 maxBound) statusIsInit
-                            let allThreadsExclusive = __all_sync (liftWord32 maxBound) statusIsExclusive
-                            let allThreadsInclusvie = __all_sync (liftWord32 maxBound) statusIsInclusive
-                            if (whileTp, allThreadsInit)
-                              -- The previous block is only initialized, so look again from the beginning
-                              then return $ pair3 done lookAtBlock (undefT tp)
-                              else do
-                                if (whileTp, allThreadsExclusive)
-                                  -- The previous thread has an exclusive prefix. Add that exclusive prefix to our running
-                                  -- prefix. If we don't have a current prefix, then set that. Also check if we can actually
-                                  -- look back another block. If not, look again from the beginning
-                                  then do
-                                    -- Can we look back another block?
-                                    if (whileTp, A.gt singleType blockId (liftInt 0))
-                                      then do
-                                        newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                          then return prevAgg
-                                                          -- TODO: Both combine ways
-                                                          else app2 combine prevAgg agg
-                                        prevBlock <- A.sub numType blockId (liftInt 1)
-                                        return $ pair3 done prevBlock newAggregate
-                                      -- Cannot look back, so reset
-                                      else return $ pair3 done lookAtBlock (undefT tp)
-                                  -- Not exclusive, so 2 possibilities left: inclusive or non-synced threads
-                                  else do
-                                    if (whileTp, allThreadsInclusvie)
-                                      -- We have an inclusive prefix, add it and stop
-                                      then do
-                                        -- Make sure no undefined behaviour happends due to `agg` being undef
-                                        newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                          then return prevAgg
-                                                          -- TODO: Both combine ways
-                                                          else app2 combine prevAgg agg
-                                        return $ pair3 (liftInt32 1) blockId newAggregate
-                                      -- If threads aren't synced, reset
-                                      else return $ pair3 done lookAtBlock (undefT tp)
-                  )
-                  (pair3 (liftInt32 0) lookAtBlock (undefT tp))
-            let (_, _, aggregateToAdd) = unPair3 r
-            if (tp, A.lt singleType tid (A.snd x2))
-              then do
-                case dir of
-                  LeftToRight -> app2 combine aggregateToAdd (A.fst x2)
-                  RightToLeft -> app2 combine (A.fst x2) aggregateToAdd
-              else do
-                return $ A.fst x2
-          else return $ A.fst x2
-
-        writeArray TypeInt arrOut j0 res
-        -- If we only set an exclusive status, we now need to set the inclusive status.
-        when (A.eq singleType status (liftInt32 scan_exclusive_known)) $
-          when (A.eq singleType tid last) $
-            writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_inclusive_known) res)
 
     return_
 
@@ -559,7 +568,7 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       warps <- A.quot integralType bd (int32 (CUDA.warpSize dev))
       
       -- Piece of shared memory to store warp aggregates
-      smem  <- dynamicSharedMem tp TypeInt32 warps (liftInt32 8)
+      smem  <- dynamicSharedMem tp TypeInt32 warps (liftInt32 16)
 
       -- Share warp aggregates
       wid   <- warpId
@@ -572,13 +581,13 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       -- not incorporate the prefix into the elements. As such, create
       -- a shared array for the warp values ...
       skipWarpPrefix <- A.mul numType warps $ liftInt32 $ P.fromIntegral $ bytesElt tp
-      skip <- A.add numType (liftInt32 8) skipWarpPrefix
+      skip <- A.add numType (liftInt32 16) skipWarpPrefix
       sflags <- dynamicSharedMem (TupRsingle scalarTypeInt32) TypeInt32 (liftInt32 0) skip
 
       -- ... and a piece of shared memory for the block total. 
       -- TODO: Figure out what is more performant, keeping two different shared arrays or keeping one,
       -- and then at the end min all the warp values (e.g. by using one thread) and sharing that
-      blockHasFlag <- dynamicSharedMem (TupRsingle scalarTypeInt32) TypeWord32 (liftWord32 1) (liftWord32 0)
+      blockHasFlag <- dynamicSharedMem (TupRsingle scalarTypeInt32) TypeWord32 (liftWord32 1) (liftWord32 8)
 
       -- Set the value of the last flag to the max value, so that the `min` function later can reduce this value
       -- to the first lane that has a flag. If the value stays the same as the warp size, we know

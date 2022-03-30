@@ -647,13 +647,16 @@ segscanAllOp intTp tp exe gamma aenv m input@(delayedShape -> ((), n)) seg@(dela
     let repr =  ArrayR dim1 tp
     let reprSeg = ArrayR dim1 $ TupRsingle $ SingleScalarType $ NumSingleType $ IntegralNumType intTp
     let reprTmp = ArrayR dim1 (TupRsingle scalarTypeInt32 `TupRpair` tp)
+    let reprBlockId = ArrayR dim1 (TupRsingle scalarTypeInt)
     let ArrayR (ShapeRsnoc shr') _ = repr
     future  <- new
     result  <- allocateRemote repr ((), m)
     tmp     <- allocateRemote reprTmp ((), s)
-    -- Tmp, Out, In, Segments
-    let paramsR = TupRsingle (ParamRarray reprTmp) `TupRpair` TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray reprSeg)
-    executeOp k1 gamma aenv dim1 ((), s) paramsR (((tmp, result), manifest input), manifest seg)
+    -- One-element 
+    blockId <- allocateRemote reprBlockId ((), 1)
+    -- BlockID, Tmp, Out, In, Segments
+    let paramsR = TupRsingle (ParamRarray reprBlockId) `TupRpair` TupRsingle (ParamRarray reprTmp) `TupRpair` TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray reprSeg)
+    executeOp k1 gamma aenv dim1 ((), s) paramsR ((((blockId, tmp), result), manifest input), manifest seg)
     put future result
     return future
 
