@@ -598,6 +598,9 @@ liftInt32 = lift $ TupRsingle scalarTypeInt32
 liftWord32 :: Word32 -> Operands Word32
 liftWord32 = lift $ TupRsingle scalarTypeWord32
 
+liftWord8 :: Word8 -> Operands Word8
+liftWord8 = lift $ TupRsingle scalarTypeWord8
+
 {-# INLINE liftBool #-}
 liftBool :: Bool -> Operands Bool
 liftBool x = OP_Bool (boolean x)
