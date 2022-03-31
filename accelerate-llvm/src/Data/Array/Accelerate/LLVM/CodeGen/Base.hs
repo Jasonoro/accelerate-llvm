@@ -24,6 +24,7 @@ module Data.Array.Accelerate.LLVM.CodeGen.Base (
   -- Arrays
   irArray,
   mutableArray,
+  mutableVolatileArray,
   delayedArray,
 
   -- Functions & parameters
@@ -103,12 +104,21 @@ irArray
     :: ArrayR  (Array sh e)
     -> Name    (Array sh e)
     -> IRArray (Array sh e)
-irArray repr@(ArrayR shr tp) n
+irArray repr n
+  = irArray' repr n NonVolatile
+
+{-# INLINABLE irArray' #-}
+irArray'
+    :: ArrayR  (Array sh e)
+    -> Name    (Array sh e)
+    -> Volatility
+    -> IRArray (Array sh e)
+irArray' repr@(ArrayR shr tp) n vol
   = IRArray repr
             (travTypeToOperands (shapeType shr) (\t i -> LocalReference (PrimType (ScalarPrimType t)) (shapeName n i)))
             (travTypeToOperands tp              (\t i -> LocalReference (PrimType (ScalarPrimType t)) (arrayName n i)))
             defaultAddrSpace
-            NonVolatile
+            vol
 
 -- | Generate typed local names for array data components as well as function
 -- parameters to bind those names
@@ -120,6 +130,14 @@ mutableArray
     -> (IRArray (Array sh e), [LLVM.Parameter])
 mutableArray repr name =
   ( irArray repr name
+  , arrayParam repr name )
+
+mutableVolatileArray
+    :: ArrayR (Array sh e)
+    -> Name (Array sh e)
+    -> (IRArray (Array sh e), [LLVM.Parameter])
+mutableVolatileArray repr name =
+  ( irArray' repr name Volatile
   , arrayParam repr name )
 
 -- | Generate a delayed array representation for input arrays which come in

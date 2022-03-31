@@ -643,20 +643,26 @@ segscanAllOp
 segscanAllOp intTp tp exe gamma aenv m input@(delayedShape -> ((), n)) seg@(delayedShape -> ((), ss)) =
   withExecutable exe $ \ptxExecutable -> do
     let k1 = ptxExecutable !# "segscanAll"
-    let s = n `multipleOf` (kernelThreadBlockSize k1)
+    let amountOfBlocks = n `multipleOf` (kernelThreadBlockSize k1)
+    -- Representation of the input / output arrays
     let repr =  ArrayR dim1 tp
+    -- Representation of the segments array
     let reprSeg = ArrayR dim1 $ TupRsingle $ SingleScalarType $ NumSingleType $ IntegralNumType intTp
+    -- Representation of the temporary array, where the status of a block is stored in conjuncture with its aggregate
     let reprTmp = ArrayR dim1 (TupRsingle scalarTypeInt32 `TupRpair` tp)
+    -- Single-element array for atomically incrementing the amount of 
     let reprBlockId = ArrayR dim1 (TupRsingle scalarTypeInt)
     let ArrayR (ShapeRsnoc shr') _ = repr
     future  <- new
     result  <- allocateRemote repr ((), m)
-    tmp     <- allocateRemote reprTmp ((), s)
-    -- One-element 
+    tmp     <- allocateRemote reprTmp ((), amountOfBlocks)
+    -- One-element array that holds an atomicaaly incremental integer counter to get a unique increasing block id.
+    -- The reason for not just using the CUDA block id is that there are no guarentees that block n is scheduled before m
+    -- when n < m. This could cause a deadlock since we rely on having the value of block n before we can finish processing m
     blockId <- allocateRemote reprBlockId ((), 1)
     -- BlockID, Tmp, Out, In, Segments
     let paramsR = TupRsingle (ParamRarray reprBlockId) `TupRpair` TupRsingle (ParamRarray reprTmp) `TupRpair` TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray reprSeg)
-    executeOp k1 gamma aenv dim1 ((), s) paramsR ((((blockId, tmp), result), manifest input), manifest seg)
+    executeOp k1 gamma aenv dim1 ((), amountOfBlocks) paramsR ((((blockId, tmp), result), manifest input), manifest seg)
     put future result
     return future
 

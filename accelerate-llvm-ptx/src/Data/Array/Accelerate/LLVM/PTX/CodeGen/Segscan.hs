@@ -126,7 +126,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
   dev <- liftCodeGen $ gets ptxDeviceProperties
   let
     (arrBlockId, paramBlockId) = mutableArray (ArrayR dim1 (TupRsingle scalarTypeInt)) "blockIdArr"
-    (arrTmp, paramTmp)  = mutableArray (ArrayR dim1 tmpTp) "tmp"
+    (arrTmp, paramTmp)  = mutableVolatileArray (ArrayR dim1 tmpTp) "tmp"
     (arrOut, paramOut) = mutableArray (ArrayR dim1 tp) "out"
     (arrIn, paramIn) = delayedArray "in" marr
     (arrSeg, paramSeg) = delayedArray "seg" mseg
@@ -135,7 +135,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
     config = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||]
     tmpTp = TupRsingle scalarTypeInt32 `TupRpair` tp
     smem n
-      | canShfl dev     = warps * bytes + 16 -- Need eight bytes to save if there was a flag, and 8 to save the incremental counter - TODO: Reduce to 1 per
+      | canShfl dev     = warps * bytes + 16 -- Need 8 bytes to save if there was a flag, and 8 to save the incremental counter - TODO: Reduce to 1 per
       | otherwise       = warps * (1 + per_warp) * bytes + 16
       where
         ws        = CUDA.warpSize dev
@@ -146,23 +146,31 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
   makeOpenAccWith config uid "segscanAll" (paramBlockId ++ paramTmp ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
     -- Size of the input array
     sz  <- indexHead <$> delayedExtent arrIn
+    -- Get all our dimensions
     bd <- blockDim
     bd' <- int bd
     tid <- threadIdx
     tid' <- int tid
     
+    -- Create a piece of shared memory to save the incremental block id
+    -- The reason for not just using the CUDA block id is that there are no guarentees that block n is scheduled before m
+    -- when n < m. This could cause a deadlock since we rely on having the value of block n before we can finish processing m
     blockIdShared <- dynamicSharedMem (TupRsingle scalarTypeInt) TypeInt (liftInt 1) (liftInt 0)
     last <- A.sub numType bd (liftInt32 1)
     when (A.eq singleType tid last) $ do
       bIdPtr <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData arrBlockId))) [op integralType (liftInt 0)]
+      -- Increment the counter atomicaaly using the last thread
       bidT    <- instr' $ AtomicRMW (IntegralNumType TypeInt) NonVolatile RMW.Add bIdPtr (op integralType (liftInt 1)) (CrossThread, AcquireRelease)
+      -- Save it to the shared memory so all blocks have access to it
       writeArray TypeInt blockIdShared (liftInt 0) (ir integralType bidT)
     
+    -- Sync the threads, as we need the value in shared memory before we continue
     __syncthreads
+    -- Grab the thread block id from shared memory
     s0  <- readArray TypeInt blockIdShared (liftInt 0)
     gd  <- gridDim
     gd' <- int gd
-    -- Start by setting the values in global memory
+    -- Start by setting the status values to 'initialized' 
     when (A.eq singleType tid last) $ do
       writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_initialized) (undefT tp))
     bd <- blockDim
@@ -209,6 +217,9 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
 
       n  <- A.sub numType sz inf
       n' <- i32 n
+      -- The segscanBlock returns the new element value, and the first flag that occured in this block
+      -- The first flag value will be used later on to know when we have to stop adding the aggregate
+      -- of the previous block to our elements.
       x2 <- if (tp `TupRpair` TupRsingle scalarTypeInt32, A.gte singleType n bd')
               then segscanBlock dir dev tp intTy combine Nothing   x1 f0
               else segscanBlock dir dev tp intTy combine (Just n') x1 f0
@@ -238,9 +249,11 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
                           (x, y)  = A.unpair e'
                           in (x, y, z)
       let pair3 x y z = A.pair (A.pair x y) z
-      lookAtBlock <- A.sub numType s0 (liftInt 1)
-      -- We now need to incorporate the previous value up until our first flag.
+      -- We now need to incorporate the previous value up until our first flag. First, we calculate the prefix
+      -- using the decoupled look-back algorithm.
       let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
+      -- The block we start looking back to, which would be the (blockId - 1)
+      lookAtBlock <- A.sub numType s0 (liftInt 1)
       res <- if (tp, A.gt singleType s0 (liftInt 0))
         then do
           r <- while (whileTp) 
@@ -266,6 +279,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
                                   -- Can we look back another block?
                                   if (whileTp, A.gt singleType blockId (liftInt 0))
                                     then do
+                                      -- Make sure the previous aggregate is not `undef`, as we init on that
                                       newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
                                                         then return prevAgg
                                                         -- TODO: Both combine ways
@@ -285,11 +299,13 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
                                                         -- TODO: Both combine ways
                                                         else app2 combine prevAgg agg
                                       return $ pair3 (liftInt32 1) blockId newAggregate
-                                    -- If threads aren't synced, reset
+                                    -- If threads do not agree with what status they have, just reset from the beginning
                                     else return $ pair3 done lookAtBlock (undefT tp)
                 )
                 (pair3 (liftInt32 0) lookAtBlock (undefT tp))
+          -- We're done, so unpack the value and find out what aggregate we have to add
           let (_, _, aggregateToAdd) = unPair3 r
+          -- Add the aggregate until we hit the first flag
           if (tp, A.lt singleType tid (A.snd x2))
             then do
               case dir of
