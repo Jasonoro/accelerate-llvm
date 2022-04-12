@@ -14,7 +14,7 @@ module Data.Array.Accelerate.LLVM.CodeGen.Constant (
 
   primConst,
   constant, scalar, single, vector, num, integral, floating, boolean,
-  undef,
+  undef, undefT,
 
 ) where
 
@@ -85,3 +85,7 @@ boolean = ConstantOperand . BooleanConstant
 undef :: ScalarType a -> Operand a
 undef t = ConstantOperand (UndefConstant (PrimType (ScalarPrimType t)))
 
+undefT :: TypeR a -> Operands a
+undefT TupRunit             = OP_Unit
+undefT (TupRpair ta tb)     = OP_Pair (undefT ta) (undefT tb)
+undefT (TupRsingle t)       = ir t (undef t)

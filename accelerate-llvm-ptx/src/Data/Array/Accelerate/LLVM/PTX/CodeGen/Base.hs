@@ -36,6 +36,7 @@ module Data.Array.Accelerate.LLVM.PTX.CodeGen.Base (
   __syncthreads, __syncthreads_count, __syncthreads_and, __syncthreads_or,
   __syncwarp, __syncwarp_mask,
   __threadfence_block, __threadfence_grid,
+  __all_sync, __any_sync, __eq_sync,
 
   -- Warp shuffle instructions
   __shfl_up, __shfl_down, __shfl_idx, __broadcast,
@@ -283,6 +284,18 @@ __threadfence_block = barrier "llvm.nvvm.membar.cta"
 --
 __threadfence_grid :: CodeGen PTX ()
 __threadfence_grid = barrier "llvm.nvvm.membar.gl"
+
+warp_sync :: Label -> Operands Word32 -> Operands Bool -> CodeGen PTX (Operands Bool)
+warp_sync label mask predicate = call (Lam primType (op integralType mask) (Lam primType (unbool predicate) (Body type' (Just Tail) label))) [NoUnwind, NoDuplicate, Convergent]
+
+__all_sync :: Operands Word32 -> Operands Bool -> CodeGen PTX (Operands Bool)
+__all_sync = warp_sync "llvm.nvvm.vote.all.sync"
+
+__any_sync :: Operands Word32 -> Operands Bool -> CodeGen PTX (Operands Bool)
+__any_sync = warp_sync "llvm.nvvm.vote.any.sync"
+
+__eq_sync :: Operands Word32 -> Operands Bool -> CodeGen PTX (Operands Bool)
+__eq_sync = warp_sync "llvm.nvvm.vote.uni.sync"
 
 
 -- Atomic functions

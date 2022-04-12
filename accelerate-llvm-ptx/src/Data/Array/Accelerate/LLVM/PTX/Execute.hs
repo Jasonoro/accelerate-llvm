@@ -432,36 +432,28 @@ scanAllOp
     -> Par PTX (Future (Vector e))
 scanAllOp tp exe gamma aenv m input@(delayedShape -> ((), n)) =
   withExecutable exe $ \ptxExecutable -> do
-    let
-        k1  = ptxExecutable !# "scanP1"
-        k2  = ptxExecutable !# "scanP2"
-        k3  = ptxExecutable !# "scanP3"
-        --
-        c   = kernelThreadBlockSize k1
-        s   = n `multipleOf` c
-        --
-        repr = ArrayR dim1 tp
-        paramR = TupRsingle $ ParamRarray repr
-        paramsR1 = paramR `TupRpair` paramR `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
-        paramsR3 = paramR `TupRpair` paramR `TupRpair` TupRsingle ParamRint
-    --
+    let k1 = ptxExecutable !# "scanAll"
+    let amountOfBlocks = n `multipleOf` (kernelThreadBlockSize k1)
+    -- Representation of the input / output arrays
+    let repr =  ArrayR dim1 tp
+    -- Representation of the temporary array, where the status of a block is stored in conjuncture with its aggregate
+    let reprTmp = ArrayR dim1 (TupRsingle scalarTypeInt32 `TupRpair` tp `TupRpair` tp)
+    -- Single-element array for atomically incrementing the amount of 
+    let reprBlockId = ArrayR dim1 (TupRsingle scalarTypeInt)
+    let ArrayR (ShapeRsnoc shr') _ = repr
     future  <- new
     result  <- allocateRemote repr ((), m)
-
-    -- Step 1: Independent thread-block-wide scans of the input. Small arrays
-    -- which can be computed by a single thread block will require no
-    -- additional work.
-    tmp     <- allocateRemote repr ((), s)
-    executeOp k1 gamma aenv dim1 ((), s) paramsR1 ((tmp, result), manifest input)
-
-    -- Step 2: Multi-block reductions need to compute the per-block prefix,
-    -- then apply those values to the partial results.
-    when (s > 1) $ do
-      executeOp k2 gamma aenv dim1 ((), s)   paramR tmp
-      executeOp k3 gamma aenv dim1 ((), s-1) paramsR3 ((tmp, result), c)
-
+    tmp     <- allocateRemote reprTmp ((), amountOfBlocks)
+    -- One-element array that holds an atomicaaly incremental integer counter to get a unique increasing block id.
+    -- The reason for not just using the CUDA block id is that there are no guarentees that block n is scheduled before m
+    -- when n < m. This could cause a deadlock since we rely on having the value of block n before we can finish processing m
+    blockId <- allocateRemote reprBlockId ((), 1)
+    -- BlockID, Tmp, Out, In, Segments
+    let paramsR = TupRsingle (ParamRarray reprBlockId) `TupRpair` TupRsingle (ParamRarray reprTmp) `TupRpair` TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr)
+    executeOp k1 gamma aenv dim1 ((), amountOfBlocks) paramsR (((blockId, tmp), result), manifest input)
     put future result
     return future
+
 
 {-# INLINE scanDimOp #-}
 scanDimOp
