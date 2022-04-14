@@ -79,7 +79,6 @@ readArrayPrim a v e i arr ix = do
   x <- load a e v p
   return x
 
-
 -- | Write a value into an array at the given index
 --
 {-# INLINEABLE writeArray #-}

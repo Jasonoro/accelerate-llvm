@@ -167,14 +167,16 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
   let
       (arrBlockId, paramBlockId) = mutableArray (ArrayR dim1 (TupRsingle scalarTypeInt)) "blockIdArr"
       (arrOut, paramOut)  = mutableArray (ArrayR dim1 tp) "out"
-      (arrTmp, paramTmp)  = mutableVolatileArray (ArrayR dim1 tmpTp) "tmp"
+      (arrTmpStatus, paramTmpStatus)  = mutableVolatileArray (ArrayR dim1 tmpStatusTp) "tmpStatus"
+      (arrTmpAgg, paramTmpAgg) = mutableVolatileArray (ArrayR dim1 tmpAggTp) "tmpAgg"
       (arrIn,  paramIn)   = delayedArray "in" marr
       paramEnv            = envParam aenv
       start               = liftInt 0
-      end                 = indexHead (irArrayShape arrTmp)
+      end                 = indexHead (irArrayShape arrTmpStatus)
       --
       config              = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||]
-      tmpTp = TupRsingle scalarTypeInt32 `TupRpair` tp `TupRpair` tp
+      tmpStatusTp = TupRsingle scalarTypeInt32
+      tmpAggTp = tp `TupRpair` tp
       smem n
         | canShfl dev     = warps * bytes + 16
         | otherwise       = warps * (1 + per_warp) * bytes + 16
@@ -184,7 +186,7 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
           per_warp  = ws + ws `P.quot` 2
           bytes     = bytesElt tp
   --
-  makeOpenAccWith config uid "scanAll" (paramBlockId ++ paramTmp ++ paramOut ++ paramIn ++ paramEnv) $ do
+  makeOpenAccWith config uid "scanAll" (paramBlockId ++ paramTmpStatus ++ paramTmpAgg ++ paramOut ++ paramIn ++ paramEnv) $ do
     -- Size of the input array
     sz  <- indexHead <$> delayedExtent arrIn
     -- Get all our dimensions
@@ -212,7 +214,8 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
     s0  <- readArray TypeInt blockIdShared (liftInt 0)
     -- Start by setting the status values to 'initialized' 
     when (A.eq singleType tid last) $ do
-      writeArray TypeInt arrTmp s0 (A.pair (A.pair (liftInt32 scan_initialized) (undefT tp)) (undefT tp))
+      writeArray TypeInt arrTmpAgg s0 (A.pair (undefT tp) (undefT tp))
+      writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_initialized)
     
     -- Index this thread block starts at
     inf <- A.mul numType s0 bd'
@@ -269,6 +272,11 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
                           in (x, y, z)
       let pair3 x y z = A.pair (A.pair x y) z
 
+      let isFirstBlock = A.eq singleType s0 (liftInt 0)
+      status <- if (TupRsingle scalarTypeInt32, isFirstBlock)
+                  then return (liftInt32 scan_inclusive_known)
+                  else return (liftInt32 scan_exclusive_known)
+
       -- We now have done block-level scans, so now we need to incorportate previous block(s) into
       -- our application. Communication is done over global memory
       -- The last thread also writes its result---the aggregate for this
@@ -276,12 +284,10 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       -- necessary for full blocks in a multi-block scan; the final
       -- partially-full tile does not have a successor block.
       when (A.eq singleType tid last) $ do
-        let isFirstBlock = A.eq singleType s0 (liftInt 0)
-        isFirstBlock' <- isFirstBlock
-        when (isFirstBlock) $
-          writeArray TypeInt arrTmp s0 (pair3 (liftInt32 scan_inclusive_known) x2 x2)
-        when (lnot isFirstBlock') $
-          writeArray TypeInt arrTmp s0 (pair3 (liftInt32 scan_exclusive_known) x2 (undefT tp))
+        writeArray TypeInt arrTmpAgg s0 (A.pair x2 x2)
+        __threadfence_grid
+        writeArray TypeInt arrTmpStatus s0 status
+      
       
       -- Threadfence so that the reads and writes are not out-of-order
       __threadfence_grid
@@ -291,53 +297,51 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
       -- The block we start looking back to, which would be the (blockId - 1)
       lookAtBlock <- A.sub numType s0 (liftInt 1)
+      let waitForAvailible = while (whileTp)
+                      (\(unPair3 -> (done, _, _)) -> A.eq singleType done (liftInt32 0))
+                      (\(unPair3 -> (done,blockId,agg)) -> do
+                          __threadfence_block
+                          previousStatus <- readArray TypeInt arrTmpStatus blockId
+                          statusIsInit <- A.eq singleType previousStatus (liftInt32 scan_initialized)
+                          let anyStillInit = __any_sync (liftWord32 maxBound) statusIsInit
+                          if (whileTp, anyStillInit)
+                            then do
+                              return $ pair3 done blockId agg
+                            else do
+                              previousAggs <- readArray TypeInt arrTmpAgg blockId
+                              let (prevAgg, inclusivePrefix) = A.unpair previousAggs
+                              newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                then return prevAgg
+                                                -- TODO: Both combine ways
+                                                else app2 combine prevAgg agg
+                              return $ pair3 (liftInt32 1) blockId newAggregate
+                      )
       res <- if (tp, A.gt singleType s0 (liftInt 0))
         then do
           r <- while (whileTp) 
                 (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
                 (\(unPair3 -> (done,blockId,agg)) -> do
-                          previousBlock <- readArray TypeInt arrTmp blockId
-                          let (status, prevAgg, inclusivePrefix) = unPair3 previousBlock
-                          statusIsInit      <- A.eq singleType status (liftInt32 scan_initialized)
-                          statusIsExclusive <- A.eq singleType status (liftInt32 scan_exclusive_known)
-                          statusIsInclusive <- A.eq singleType status (liftInt32 scan_inclusive_known)
-                          let allThreadsInit      = __all_sync (liftWord32 maxBound) statusIsInit
-                          let allThreadsExclusive = __all_sync (liftWord32 maxBound) statusIsExclusive
+                          previousStatus <- readArray TypeInt arrTmpStatus blockId
+                          statusIsInclusive <- A.eq singleType previousStatus (liftInt32 scan_inclusive_known)
                           let allThreadsInclusvie = __all_sync (liftWord32 maxBound) statusIsInclusive
-                          if (whileTp, allThreadsInit)
-                            -- The previous block is only initialized, so look again from the beginning
-                            then return $ pair3 done lookAtBlock (undefT tp)
+                          if (whileTp, allThreadsInclusvie)
+                            then do
+                              previousAggs <- readArray TypeInt arrTmpAgg blockId
+                              let (prevAgg, inclusivePrefix) = A.unpair previousAggs
+                              -- Make sure no undefined behaviour happends due to `agg` being undef
+                              newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                then return inclusivePrefix
+                                                -- TODO: Both combine ways
+                                                else app2 combine inclusivePrefix agg
+                              return $ pair3 (liftInt32 1) blockId newAggregate
                             else do
-                              if (whileTp, allThreadsExclusive)
-                                -- The previous thread has an exclusive prefix. Add that exclusive prefix to our running
-                                -- prefix. If we don't have a current prefix, then set that. Also check if we can actually
-                                -- look back another block. If not, look again from the beginning
+                              if (whileTp, A.gt singleType blockId (liftInt 0))
                                 then do
-                                  -- Can we look back another block?
-                                  if (whileTp, A.gt singleType blockId (liftInt 0))
-                                    then do
-                                      -- Make sure the previous aggregate is not `undef`, as we init on that
-                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                        then return prevAgg
-                                                        -- TODO: Both combine ways
-                                                        else app2 combine prevAgg agg
-                                      prevBlock <- A.sub numType blockId (liftInt 1)
-                                      return $ pair3 done prevBlock newAggregate
-                                    -- Cannot look back, so reset
-                                    else return $ pair3 done lookAtBlock (undefT tp)
-                                -- Not exclusive, so 2 possibilities left: inclusive or non-synced threads
-                                else do
-                                  if (whileTp, allThreadsInclusvie)
-                                    -- We have an inclusive prefix, add it and stop
-                                    then do
-                                      -- Make sure no undefined behaviour happends due to `agg` being undef
-                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                        then return inclusivePrefix
-                                                        -- TODO: Both combine ways
-                                                        else app2 combine inclusivePrefix agg
-                                      return $ pair3 (liftInt32 1) blockId newAggregate
-                                    -- If threads do not agree with what status they have, just reset from the beginning
-                                    else return $ pair3 done lookAtBlock (undefT tp)
+                                  waitR <- waitForAvailible $ pair3 done blockId agg
+                                  let (_, _, newAggregate) = unPair3 waitR
+                                  prevBlock <- A.sub numType blockId (liftInt 1)
+                                  return $ pair3 done prevBlock newAggregate
+                                else return $ pair3 done lookAtBlock (undefT tp)
                 )
                 (pair3 (liftInt32 0) lookAtBlock (undefT tp))
           -- We're done, so unpack the value and find out what aggregate we have to add
@@ -349,8 +353,11 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
 
       writeArray TypeInt arrOut j0 res
       -- If we only set an exclusive status, we now need to set the inclusive status.
-      when (A.eq singleType tid last) $
-        writeArray TypeInt arrTmp s0 (pair3 (liftInt32 scan_inclusive_known) x2 res)
+      when (A.eq singleType tid last) $ do
+        writeArray TypeInt arrTmpAgg s0 (A.pair x2 res)
+        __threadfence_grid
+        writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_inclusive_known)
+
     return_
 
 -- Parallel scan, step 2
