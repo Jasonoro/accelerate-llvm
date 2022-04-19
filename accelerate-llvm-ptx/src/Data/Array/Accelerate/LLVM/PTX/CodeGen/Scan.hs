@@ -213,12 +213,9 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
     -- Grab the thread block id from shared memory
     s0  <- readArray TypeInt blockIdShared (liftInt 0)
     -- Start by setting the status values to 'initialized' 
-    when (A.eq singleType tid last) $ do
-      writeArray TypeInt arrTmpAgg s0 (A.pair (undefT tp) (undefT tp))
-      writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_initialized)
     
     -- Index this thread block starts at
-    inf <- A.mul numType s0 bd'
+    inf <- A.mul numType (liftInt elementsPerThread) =<< A.mul numType s0 bd'
 
     -- index i0 is the index this thread will read from
     i0 <- case dir of
@@ -287,10 +284,8 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
         writeArray TypeInt arrTmpAgg s0 (A.pair x2 x2)
         __threadfence_grid
         writeArray TypeInt arrTmpStatus s0 status
-      
-      
-      -- Threadfence so that the reads and writes are not out-of-order
-      __threadfence_grid
+
+      __syncthreads
 
       -- We now need to incorporate the previous value up until our first flag. First, we calculate the prefix
       -- using the decoupled look-back algorithm.
@@ -300,11 +295,9 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       let waitForAvailible = while (whileTp)
                       (\(unPair3 -> (done, _, _)) -> A.eq singleType done (liftInt32 0))
                       (\(unPair3 -> (done,blockId,agg)) -> do
-                          __threadfence_block
                           previousStatus <- readArray TypeInt arrTmpStatus blockId
-                          statusIsInit <- A.eq singleType previousStatus (liftInt32 scan_initialized)
-                          let anyStillInit = __any_sync (liftWord32 maxBound) statusIsInit
-                          if (whileTp, anyStillInit)
+                          let statusIsInit = A.eq singleType previousStatus (liftInt32 scan_initialized)
+                          if (whileTp, statusIsInit)
                             then do
                               return $ pair3 done blockId agg
                             else do
@@ -321,6 +314,7 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
           r <- while (whileTp) 
                 (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
                 (\(unPair3 -> (done,blockId,agg)) -> do
+                          __threadfence_block
                           previousStatus <- readArray TypeInt arrTmpStatus blockId
                           statusIsInclusive <- A.eq singleType previousStatus (liftInt32 scan_inclusive_known)
                           let allThreadsInclusvie = __all_sync (liftWord32 maxBound) statusIsInclusive
@@ -351,13 +345,13 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
             RightToLeft -> app2 combine x2 aggregateToAdd
         else return x2
 
-      writeArray TypeInt arrOut j0 res
       -- If we only set an exclusive status, we now need to set the inclusive status.
       when (A.eq singleType tid last) $ do
         writeArray TypeInt arrTmpAgg s0 (A.pair x2 res)
         __threadfence_grid
         writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_inclusive_known)
-
+      
+      writeArray TypeInt arrOut j0 res
     return_
 
 -- Parallel scan, step 2
