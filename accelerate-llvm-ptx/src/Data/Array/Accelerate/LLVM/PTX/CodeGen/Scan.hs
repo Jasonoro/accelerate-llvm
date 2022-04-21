@@ -62,7 +62,9 @@ import Control.Monad.State                                          ( gets )
 import Data.String                                                  ( fromString )
 import Data.Coerce                                                  as Safe
 import Data.Bits                                                    as P
-import Prelude                                                      as P hiding ( last )
+import qualified Data.Maybe                                                   as M
+import Prelude                                                      as P
+import GHC.TypeLits
 
 
 
@@ -151,6 +153,47 @@ scan_inclusive_known = 2
 -- initial element and any fused functions on the way. The final reduction
 -- result of this chunk is written to a separate array.
 --
+
+type OperandsGrouped e = Operands ((((((e, e), e), e), e), e), e)
+type OperandsGroupedI e = (Operands e, Operands e, Operands e, Operands e, Operands e, Operands e, Operands e)
+elementsPerThread   = 7
+
+unpairGrouped :: OperandsGrouped e -> OperandsGroupedI e
+unpairGrouped t1 = (a, b, c, d, e, f, g)
+  where
+   (t2, g) = A.unpair t1
+   (t3, f) = A.unpair t2
+   (t4, e) = A.unpair t3
+   (t5, d) = A.unpair t4
+   (t6, c) = A.unpair t5
+   (a,  b) = A.unpair t6
+
+pairGrouped :: OperandsGroupedI e -> OperandsGrouped e
+pairGrouped (a, b, c, d, e, f, g) = A.pair (A.pair (A.pair (A.pair (A.pair (A.pair a b) c) d) e) f) g
+
+applyToTuple :: forall aenv e a.
+                (Operands e -> CodeGen PTX (Operands a))
+             -> OperandsGrouped e
+             -> CodeGen PTX (OperandsGrouped a)
+applyToTuple f tp = do
+  let (t1, t2, t3, t4, t5, t6, t7) = unpairGrouped tp
+  t1' <- f t1
+  t2' <- f t2
+  t3' <- f t3
+  t4' <- f t4
+  t5' <- f t5
+  t6' <- f t6
+  t7' <- f t7
+  return $ pairGrouped (t1', t2', t3', t4', t5', t6', t7')
+
+typeToTuple :: TypeR a -> TypeR ((((((a, a), a), a), a), a), a)
+typeToTuple tp = tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp
+
+lastTuple :: OperandsGrouped e -> Operands e
+lastTuple t = last
+  where (_, _, _, _, _, _, last) = unpairGrouped t
+
+
 mkScanAllP1
     :: forall aenv e.
        Direction
@@ -174,9 +217,11 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       start               = liftInt 0
       end                 = indexHead (irArrayShape arrTmpStatus)
       --
-      config              = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||]
+      config              = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||] elementsPerThread
       tmpStatusTp = TupRsingle scalarTypeInt32
       tmpAggTp = tp `TupRpair` tp
+      {-elementsPerThreadKnown = M.fromJust $ someNatVal $ P.fromIntegral elementsPerThread
+      localArrayTp = liftToVectorR elementsPerThread tp -}
       smem n
         | canShfl dev     = warps * bytes + 16
         | otherwise       = warps * (1 + per_warp) * bytes + 16
@@ -217,15 +262,15 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
     -- Index this thread block starts at
     inf <- A.mul numType (liftInt elementsPerThread) =<< A.mul numType s0 bd'
 
-    -- index i0 is the index this thread will read from
+    -- index i0 is the firstindex this thread will read from
     i0 <- case dir of
-            LeftToRight -> A.add numType inf tid'
+            LeftToRight -> A.add numType inf =<< A.mul numType (liftInt elementsPerThread) tid'
             RightToLeft -> do x <- A.sub numType sz inf
                               y <- A.sub numType x tid'
                               z <- A.sub numType y (liftInt 1)
                               return z
     
-    -- index j* is the index that we write to. Recall that for exclusive scans
+    -- index j* is the first index that we write to. Recall that for exclusive scans
     -- the output array is one larger than the input; the initial element will
     -- be written into this spot by thread 0 of the first thread block.
     j0    <- case mseed of
@@ -239,29 +284,41 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
                     LeftToRight -> A.lt  singleType i sz
                     RightToLeft -> A.gte singleType i (liftInt 0)
 
+
+
     when (valid i0) $ do
-      x0 <- app1 (delayedLinearIndex arrIn) i0
-      x1 <- case mseed of
-              Nothing   -> return x0
-              Just seed ->
-                if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType s0 (liftInt 0))
-                  then do
-                    z <- seed
-                    case dir of
-                      LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x0
-                      RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x0 z
-                  else
-                    return x0
+      let indexFunc = \x y -> case dir of
+                                LeftToRight -> A.add numType x (liftInt y)
+                                RightToLeft -> A.sub numType x (liftInt y)
+      x0 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 0)
+      x1 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 1)
+      x2 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 2)
+      x3 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 3)
+      x4 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 4)
+      x5 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 5)
+      x6 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 6)
+      let seedF = \x -> case mseed of
+                              Nothing   -> return x
+                              Just seed ->
+                                if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType s0 (liftInt 0))
+                                  then do
+                                    z <- seed
+                                    case dir of
+                                      LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x
+                                      RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x z
+                                  else
+                                    return x0
+      resSeeded <- applyToTuple seedF $ pairGrouped (x0, x1, x2, x3, x4, x5, x6)
+
 
       n  <- A.sub numType sz inf
       n' <- i32 n
       -- The segscanBlock returns the new element value, and the first flag that occured in this block
       -- The first flag value will be used later on to know when we have to stop adding the aggregate
       -- of the previous block to our elements.
-      x2 <- if (tp, A.gte singleType n bd')
-              then scanBlock dir dev tp combine Nothing   x1
-              else scanBlock dir dev tp combine (Just n') x1
-
+      blockRes <- if (typeToTuple tp, A.gte singleType n bd')
+                    then scanBlockShfl' dir dev tp combine Nothing   resSeeded
+                    else scanBlockShfl' dir dev tp combine (Just n') resSeeded
 
       -- Functions to (de)construct 3-pair tuples
       let unPair3 e = let (e', z) = A.unpair e
@@ -281,7 +338,7 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
       -- necessary for full blocks in a multi-block scan; the final
       -- partially-full tile does not have a successor block.
       when (A.eq singleType tid last) $ do
-        writeArray TypeInt arrTmpAgg s0 (A.pair x2 x2)
+        writeArray TypeInt arrTmpAgg s0 (A.pair (lastTuple blockRes) (lastTuple blockRes))
         __threadfence_grid
         writeArray TypeInt arrTmpStatus s0 status
 
@@ -309,7 +366,7 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
                                                 else app2 combine prevAgg agg
                               return $ pair3 (liftInt32 1) blockId newAggregate
                       )
-      res <- if (tp, A.gt singleType s0 (liftInt 0))
+      res <- if (typeToTuple tp, A.gt singleType s0 (liftInt 0))
         then do
           r <- while (whileTp) 
                 (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
@@ -340,18 +397,28 @@ mkScanAllP1 dir uid aenv tp combine mseed marr = do
                 (pair3 (liftInt32 0) lookAtBlock (undefT tp))
           -- We're done, so unpack the value and find out what aggregate we have to add
           let (_, _, aggregateToAdd) = unPair3 r
-          case dir of
-            LeftToRight -> app2 combine aggregateToAdd x2
-            RightToLeft -> app2 combine x2 aggregateToAdd
-        else return x2
+          let combine' = \x -> case dir of
+                                LeftToRight -> app2 combine aggregateToAdd x
+                                RightToLeft -> app2 combine x aggregateToAdd
+          applyToTuple combine' blockRes
+        else return blockRes
 
       -- If we only set an exclusive status, we now need to set the inclusive status.
       when (A.eq singleType tid last) $ do
-        writeArray TypeInt arrTmpAgg s0 (A.pair x2 res)
+        writeArray TypeInt arrTmpAgg s0 (A.pair (lastTuple blockRes) (lastTuple res))
         __threadfence_grid
         writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_inclusive_known)
       
-      writeArray TypeInt arrOut j0 res
+      let (res1, res2, res3, res4, res5, res6, res7) = unpairGrouped res
+      let writeArray' = flip $ writeArray TypeInt arrOut
+      writeArray' res1 =<< (indexFunc j0 0)
+      writeArray' res2 =<< (indexFunc j0 1)
+      writeArray' res3 =<< (indexFunc j0 2)
+      writeArray' res4 =<< (indexFunc j0 3)
+      writeArray' res5 =<< (indexFunc j0 4)
+      writeArray' res6 =<< (indexFunc j0 5)
+      writeArray' res7 =<< (indexFunc j0 6)
+
     return_
 
 -- Parallel scan, step 2
@@ -1550,6 +1617,127 @@ scanWarpShfl dir dev tp combine = scan 0
                       return x
 
           scan (step+1) x'
+
+scanBlockShfl'
+    :: forall aenv e.
+       Direction
+    -> DeviceProperties                             -- ^ properties of the target device
+    -> TypeR e
+    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
+    -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
+    -> OperandsGrouped e                           -- ^ calling thread's input elements
+    -> CodeGen PTX (OperandsGrouped e)
+scanBlockShfl' dir dev tp combine nelem = warpScan >=> warpPrefix
+  where
+    int32 :: Integral a => a -> Operands Int32
+    int32 = liftInt32 . P.fromIntegral
+
+    -- Temporary storage required for each warp
+    -- warp_smem_elems = CUDA.warpSize dev + (CUDA.warpSize dev `P.quot` 2)
+    -- warp_smem_bytes = warp_smem_elems  * bytesElt tp
+
+    -- Step 1: Scan in every warp
+    warpScan :: OperandsGrouped e -> CodeGen PTX (OperandsGrouped e)
+    warpScan = scanWarpShfl' dir dev tp combine
+
+    -- Step 2: Collect the aggregate results of each warp to compute the prefix
+    -- values for each warp and combine with the partial result to compute each
+    -- thread's final value.
+    warpPrefix :: OperandsGrouped e -> CodeGen PTX (OperandsGrouped e)
+    warpPrefix input = do
+      -- Allocate #warps elements of shared memory
+      bd    <- blockDim
+      warps <- A.quot integralType bd (int32 (CUDA.warpSize dev))
+      smem  <- dynamicSharedMem tp TypeInt32 warps (liftInt32 16)
+
+      -- Share warp aggregates
+      wid   <- warpId
+      lane  <- laneId
+      when (A.eq singleType lane (int32 (CUDA.warpSize dev - 1))) $ do
+        writeArray TypeInt32 smem wid $ lastTuple input
+
+      -- Wait for each warp to finish its local scan and share the aggregate
+      __syncthreads
+
+      -- Compute the prefix value for this warp and add to the partial result.
+      -- This step is not required for the first warp, which has no carry-in.
+      if (typeToTuple tp, A.eq singleType wid (liftInt32 0))
+        then return input
+        else do
+          -- Every thread sequentially scans the warp aggregates to compute
+          -- their prefix value. We do this sequentially, but could also have
+          -- warp 0 do it cooperatively if we limit thread block sizes to
+          -- (warp size ^ 2).
+          steps <- case nelem of
+                      Nothing -> return wid
+                      Just n  -> A.min singleType wid =<< A.quot integralType n (int32 (CUDA.warpSize dev * elementsPerThread))
+
+          p0     <- readArray TypeInt32 smem (liftInt32 0)
+          prefix <- iterFromStepTo tp (liftInt32 1) (liftInt32 1) steps p0 $ \step x -> do
+                      y <- readArray TypeInt32 smem step
+                      case dir of
+                        LeftToRight -> app2 combine x y
+                        RightToLeft -> app2 combine y x
+          let combineF = \prefix input ->
+                          case dir of
+                            LeftToRight -> app2 combine prefix input
+                            RightToLeft -> app2 combine input prefix
+          applyToTuple (combineF prefix) input
+
+scanWarpShfl'
+    :: forall aenv e.
+       Direction
+    -> DeviceProperties                             -- ^ properties of the target device
+    -> TypeR e
+    -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
+    -> OperandsGrouped e                                   -- ^ calling thread's input elements
+    -> CodeGen PTX (OperandsGrouped e)
+scanWarpShfl' dir dev tp combine elements = do
+  newEls <- prescan elements
+  scan 0 (lastTuple newEls) newEls
+  where
+
+    log2 :: Double -> Double
+    log2 = P.logBase 2
+
+    -- Number of steps required to scan warp
+    steps = P.floor (log2 (P.fromIntegral (CUDA.warpSize dev)))
+
+    -- TODO: Scan both ways
+    prescan :: OperandsGrouped e -> CodeGen PTX (OperandsGrouped e)
+    prescan els = do
+      let (x1, x2, x3, x4, x5, x6, x7) = unpairGrouped els
+      x2' <- app2 combine x1 x2
+      x3' <- app2 combine x2' x3
+      x4' <- app2 combine x3' x4
+      x5' <- app2 combine x4' x5
+      x6' <- app2 combine x5' x6
+      x7' <- app2 combine x6' x7
+      return $ pairGrouped (x1, x2', x3', x4', x5', x6', x7')
+
+    -- Unfold the scan as a recursive code generation function
+    scan :: Int -> Operands e -> OperandsGrouped e -> CodeGen PTX (OperandsGrouped e)
+    scan step x els
+      | step >= steps = return els
+      | otherwise     = do
+          let offset = 1 `P.shiftL` step
+
+          -- share partial result through shared memory buffer
+          y    <- __shfl_up tp x (liftWord32 offset)
+          lane <- laneId
+
+          -- update partial result if in range
+          let updateEl = \x y -> if (tp, A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
+                                   then do
+                                     case dir of
+                                       LeftToRight -> app2 combine y x
+                                       RightToLeft -> app2 combine x y
+                                   else
+                                     return x
+          newTuple <- applyToTuple (\x -> updateEl x y) els
+
+          scan (step+1) (lastTuple newTuple) newTuple
+
 
 -- Utilities
 -- ---------

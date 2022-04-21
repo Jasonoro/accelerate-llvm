@@ -724,7 +724,6 @@ dynamicSharedMem tp int n@(op int -> m) (op int -> offset)
                        , irArrayVolatility = sharedMemVolatility
                        }
 
-
 -- Other functions
 -- ---------------
 
