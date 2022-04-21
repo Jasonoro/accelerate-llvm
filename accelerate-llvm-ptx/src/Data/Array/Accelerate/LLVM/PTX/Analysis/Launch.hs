@@ -69,13 +69,14 @@ launchConfigNoMaxBlocks
     -> (Int -> Int)                 -- ^ Shared memory (#bytes) as a function of thread block size
     -> (Int -> Int -> Int)          -- ^ Determine grid size for input size 'n' (first arg) over thread blocks of size 'm' (second arg)
     -> CodeQ (Int -> Int -> Int)
+    -> Int
     -> LaunchConfig
-launchConfigNoMaxBlocks dev candidates dynamic_smem grid_size grid_sizeQ maxThreads registers static_smem =
+launchConfigNoMaxBlocks dev candidates dynamic_smem grid_size grid_sizeQ elementsPerThread maxThreads registers static_smem =
   let
       (cta, occ)  = CUDA.optimalBlockSizeOf dev (filter (<= maxThreads) candidates) (const registers) smem
-      grid n      = grid_size n cta
+      grid n      = multipleOf (grid_size n cta) elementsPerThread
       smem n      = static_smem + dynamic_smem n
-      gridQ       = [|| \n -> $$grid_sizeQ (n::Int) (cta::Int) ||]
+      gridQ       = [|| \n -> $$grid_sizeQ (n::Int) (cta::Int) `multipleOf` elementsPerThread ||]
   in
   ( occ, cta, grid, dynamic_smem cta, gridQ )
 

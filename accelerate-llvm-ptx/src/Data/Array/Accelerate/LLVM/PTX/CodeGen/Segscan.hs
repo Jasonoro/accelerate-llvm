@@ -89,7 +89,7 @@ mkSegscan
     -> MIRDelayed   PTX aenv (Segments i)
     -> CodeGen      PTX      (IROpenAcc PTX aenv (Array (sh, Int) e))
 mkSegscan uid aenv repr intTy dir combine seed arr seg
-  = DT.trace "mkSegscan" $ foldr1 (+++) <$> sequence (codeScan ++ codeFill)
+  = foldr1 (+++) <$> sequence (codeScan ++ codeFill)
 
   where
     codeScan = case repr of
@@ -110,6 +110,67 @@ scan_exclusive_known = 1
 scan_inclusive_known :: Int32
 scan_inclusive_known = 2
 
+type OperandsGrouped e = Operands ((((((e, e), e), e), e), e), e)
+type OperandsGroupedI e = (Operands e, Operands e, Operands e, Operands e, Operands e, Operands e, Operands e)
+type OperandsGroupedS e = Operands (((((((e, e), e), e), e), e), e), Int32)
+elementsPerThread   = 7
+
+unpairGrouped :: OperandsGrouped e -> OperandsGroupedI e
+unpairGrouped t1 = (a, b, c, d, e, f, g)
+  where
+   (t2, g) = A.unpair t1
+   (t3, f) = A.unpair t2
+   (t4, e) = A.unpair t3
+   (t5, d) = A.unpair t4
+   (t6, c) = A.unpair t5
+   (a,  b) = A.unpair t6
+
+pairGrouped :: OperandsGroupedI e -> OperandsGrouped e
+pairGrouped (a, b, c, d, e, f, g) = A.pair (A.pair (A.pair (A.pair (A.pair (A.pair a b) c) d) e) f) g
+
+applyToTuple :: forall aenv e a.
+                (Operands e -> CodeGen PTX (Operands a))
+             -> OperandsGrouped e
+             -> CodeGen PTX (OperandsGrouped a)
+applyToTuple f tp = do
+  let (t1, t2, t3, t4, t5, t6, t7) = unpairGrouped tp
+  t1' <- f t1
+  t2' <- f t2
+  t3' <- f t3
+  t4' <- f t4
+  t5' <- f t5
+  t6' <- f t6
+  t7' <- f t7
+  return $ pairGrouped (t1', t2', t3', t4', t5', t6', t7')
+
+applyToTupleZip :: forall aenv e f.
+                   (Operands e -> Operands f -> CodeGen PTX (Operands (e, Int)))
+                 -> TypeR e
+                 -> OperandsGrouped e
+                 -> OperandsGrouped f
+                 -> CodeGen PTX (OperandsGrouped e)
+applyToTupleZip f typ tp hp = do
+  let (t1, t2, t3, t4, t5, t6, t7) = unpairGrouped tp
+  let (h1, h2, h3, h4, h5, h6, h7) = unpairGrouped hp
+  let check = \cond func t1 h1 -> if (typ `TupRpair` TupRsingle scalarTypeInt, A.gt singleType cond (liftInt 0)) 
+                                    then return $ A.pair t1 cond 
+                                    else f t1 h1
+  t1' <- check (liftInt 0)    f t1 h1
+  t2' <- check (A.snd t1')    f t2 h2
+  t3' <- check (A.snd t2')    f t3 h3
+  t4' <- check (A.snd t3')    f t4 h4
+  t5' <- check (A.snd t4')    f t5 h5
+  t6' <- check (A.snd t5')    f t6 h6
+  t7' <- check (A.snd t6')    f t7 h7
+  return $ pairGrouped (A.fst t1', A.fst t2', A.fst t3', A.fst t4', A.fst t5', A.fst t6', A.fst t7')
+
+typeToTuple :: TypeR a -> TypeR ((((((a, a), a), a), a), a), a)
+typeToTuple tp = tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp
+
+lastTuple :: OperandsGrouped e -> Operands e
+lastTuple t = last
+  where (_, _, _, _, _, _, last) = unpairGrouped t
+
 mkSegscanAll
     :: forall aenv e i.
        Direction
@@ -122,18 +183,20 @@ mkSegscanAll
     -> MIRDelayed PTX aenv (Vector e) -- ^ input data
     -> MIRDelayed PTX aenv (Segments i) -- ^ head flags
     -> CodeGen PTX (IROpenAcc PTX aenv (Vector e))
-mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running mkSegscanAll..." $ do
+mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
   dev <- liftCodeGen $ gets ptxDeviceProperties
   let
     (arrBlockId, paramBlockId) = mutableArray (ArrayR dim1 (TupRsingle scalarTypeInt)) "blockIdArr"
-    (arrTmp, paramTmp)  = mutableVolatileArray (ArrayR dim1 tmpTp) "tmp"
+    (arrTmpStatus, paramTmpStatus)  = mutableVolatileArray (ArrayR dim1 tmpStatusTp) "tmpStatus"
+    (arrTmpAgg, paramTmpAgg) = mutableVolatileArray (ArrayR dim1 tmpAggTp) "tmpAgg"
     (arrOut, paramOut) = mutableArray (ArrayR dim1 tp) "out"
     (arrIn, paramIn) = delayedArray "in" marr
     (arrSeg, paramSeg) = delayedArray "seg" mseg
-    end = indexHead (irArrayShape arrOut)
+    end = indexHead (irArrayShape arrTmpStatus)
     paramEnv = envParam aenv
-    config = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||]
-    tmpTp = TupRsingle scalarTypeInt32 `TupRpair` tp
+    config = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) smem const [|| const ||] elementsPerThread
+    tmpStatusTp = TupRsingle scalarTypeInt32
+    tmpAggTp = tp `TupRpair` tp
     smem n
       | canShfl dev     = warps * bytes + 16 -- Need 8 bytes to save if there was a flag, and 8 to save the incremental counter - TODO: Reduce to 1 per
       | otherwise       = warps * (1 + per_warp) * bytes + 16
@@ -143,7 +206,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
         per_warp  = ws + ws `P.quot` 2
         bytes     = bytesElt tp + bytesElt (TupRsingle scalarTypeInt32)
   --
-  makeOpenAccWith config uid "segscanAll" (paramBlockId ++ paramTmp ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
+  makeOpenAccWith config uid "segscanAll" (paramBlockId ++ paramTmpStatus ++ paramTmpAgg ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
     -- Size of the input array
     sz  <- indexHead <$> delayedExtent arrIn
     -- Get all our dimensions
@@ -153,13 +216,13 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
     tid' <- int tid
     
     -- Create a piece of shared memory to save the incremental block id
-    -- The reason for not just using the CUDA block id is that there are no guarentees that block n is scheduled before m
+    -- The reason for not just using the CUDA block id is that there are no guarantees that block n is scheduled before m
     -- when n < m. This could cause a deadlock since we rely on having the value of block n before we can finish processing m
     blockIdShared <- dynamicSharedMem (TupRsingle scalarTypeInt) TypeInt (liftInt 1) (liftInt 0)
     last <- A.sub numType bd (liftInt32 1)
     when (A.eq singleType tid last) $ do
       bIdPtr <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData arrBlockId))) [op integralType (liftInt 0)]
-      -- Increment the counter atomicaaly using the last thread
+      -- Increment the counter atomically using the last thread
       bidT    <- instr' $ AtomicRMW (IntegralNumType TypeInt) NonVolatile RMW.Add bIdPtr (op integralType (liftInt 1)) (CrossThread, AcquireRelease)
       -- Save it to the shared memory so all blocks have access to it
       writeArray TypeInt blockIdShared (liftInt 0) (ir integralType bidT)
@@ -170,17 +233,15 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
     s0  <- readArray TypeInt blockIdShared (liftInt 0)
     gd  <- gridDim
     gd' <- int gd
-    -- Start by setting the status values to 'initialized' 
-    when (A.eq singleType tid last) $ do
-      writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_initialized) (undefT tp))
     bd <- blockDim
     bd' <- int bd
     -- Index this thread block starts at
-    inf <- A.mul numType s0 bd'
+    inf <- A.mul numType (liftInt elementsPerThread) =<< A.mul numType s0 bd'
 
     -- index i0 is the index this thread will read from
+    -- TODO: Right-to-left
     i0 <- case dir of
-            LeftToRight -> A.add numType inf tid'
+            LeftToRight -> A.add numType inf =<< A.mul numType (liftInt elementsPerThread) tid'
             RightToLeft -> do x <- A.sub numType sz inf
                               y <- A.sub numType x tid'
                               z <- A.sub numType y (liftInt 1)
@@ -201,126 +262,168 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = DT.trace "Running m
                     RightToLeft -> A.gte singleType i (liftInt 0)
 
     when (valid i0) $ do
-      x0 <- app1 (delayedLinearIndex arrIn) i0
-      f0 <- app1 (delayedLinearIndex arrSeg) i0
-      x1 <- case mseed of
-              Nothing   -> return x0
-              Just seed ->
-                if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType s0 (liftInt 0))
-                  then do
-                    z <- seed
-                    case dir of
-                      LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x0
-                      RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x0 z
-                  else
-                    return x0
+      let indexFunc = \x y -> case dir of
+                          LeftToRight -> A.add numType x (liftInt y)
+                          RightToLeft -> A.sub numType x (liftInt y)
+      x0 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 0)
+      x1 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 1)
+      x2 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 2)
+      x3 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 3)
+      x4 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 4)
+      x5 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 5)
+      x6 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 6)
+      let seedF = \x -> case mseed of
+                              Nothing   -> return x
+                              Just seed ->
+                                if (tp, A.eq singleType tid (liftInt32 0) `A.land'` A.eq singleType s0 (liftInt 0))
+                                  then do
+                                    z <- seed
+                                    case dir of
+                                      LeftToRight -> writeArray TypeInt32 arrOut (liftInt32 0) z >> app2 combine z x
+                                      RightToLeft -> writeArray TypeInt   arrOut sz            z >> app2 combine x z
+                                  else
+                                    return x0
+      resSeeded <- applyToTuple seedF $ pairGrouped (x0, x1, x2, x3, x4, x5, x6)
+
+      f0 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 0)
+      f1 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 1)
+      f2 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 2)
+      f3 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 3)
+      f4 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 4)
+      f5 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 5)
+      f6 <- app1 (delayedLinearIndex arrSeg) =<< (indexFunc i0 6)
+      let resSegments = pairGrouped (f0, f1, f2, f3, f4, f5, f6)
 
       n  <- A.sub numType sz inf
       n' <- i32 n
       -- The segscanBlock returns the new element value, and the first flag that occured in this block
       -- The first flag value will be used later on to know when we have to stop adding the aggregate
       -- of the previous block to our elements.
-      x2 <- if (tp `TupRpair` TupRsingle scalarTypeInt32, A.gte singleType n bd')
-              then segscanBlock dir dev tp intTy combine Nothing   x1 f0
-              else segscanBlock dir dev tp intTy combine (Just n') x1 f0
+      blockRes <- if ((typeToTuple tp) `TupRpair` TupRsingle scalarTypeInt32, A.gte singleType n bd')
+              then segscanBlock dir dev tp intTy combine Nothing   resSeeded resSegments
+              else segscanBlock dir dev tp intTy combine (Just n') resSeeded resSegments
 
 
       -- We now have done block-level scans, so now we need to incorportate previous block(s) into
       -- our application. Communication is done over global memory
-      let hadFlag = A.neq singleType (A.snd x2) (liftInt32 maxBound)
+      let hadFlag = A.neq singleType (A.snd blockRes) (liftInt32 maxBound)
       let isFirstBlock = A.eq singleType s0 (liftInt 0)
       status <- if (TupRsingle scalarTypeInt32, hadFlag `lor'` isFirstBlock)
                   then return (liftInt32 scan_inclusive_known)
                   else return (liftInt32 scan_exclusive_known)
 
+      -- Function to deconstruct the tuple
+      let unPair3 e = let (e', z) = A.unpair e
+                          (x, y)  = A.unpair e'
+                          in (x, y, z)
+      let pair3 x y z = A.pair (A.pair x y) z
+
+      let unPair4 e = let (e', y, z) = unPair3 e
+                          (w, x) = A.unpair e'
+                          in (w, x, y, z)
+      let pair4 w x y z = A.pair (pair3 w x y) z
+      
       -- The last thread also writes its result---the aggregate for this
       -- thread block, and it's corresponding status---to the temporary array. This is only
       -- necessary for full blocks in a multi-block scan; the final
       -- partially-full tile does not have a successor block.
       last <- A.sub numType bd (liftInt32 1)
-      when (A.eq singleType tid last) $
-        writeArray TypeInt arrTmp s0 (A.pair status (A.fst x2))
+      when (A.eq singleType tid last) $ do
+        writeArray TypeInt arrTmpAgg s0 (A.pair (lastTuple $ A.fst blockRes) (lastTuple $ A.fst blockRes))
+        __threadfence_grid
+        writeArray TypeInt arrTmpStatus s0 status
       
-      -- Threadfence so that the reads and writes are not out-of-order
-      __threadfence_grid
+      __syncthreads
 
-      -- Function to deconstruct the tuple in the while loop
-      let unPair3 e = let (e', z) = A.unpair e
-                          (x, y)  = A.unpair e'
-                          in (x, y, z)
-      let pair3 x y z = A.pair (A.pair x y) z
       -- We now need to incorporate the previous value up until our first flag. First, we calculate the prefix
       -- using the decoupled look-back algorithm.
       let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
       -- The block we start looking back to, which would be the (blockId - 1)
       lookAtBlock <- A.sub numType s0 (liftInt 1)
-      res <- if (tp, A.gt singleType s0 (liftInt 0))
+      let waitForAvailible = while (whileTp `TupRpair` TupRsingle scalarTypeInt32)
+                        (\(unPair4 -> (done, _, _, _)) -> A.eq singleType done (liftInt32 0))
+                        (\(unPair4 -> (done,blockId,agg,_)) -> do
+                            previousStatus <- readArray TypeInt arrTmpStatus blockId
+                            let statusIsInit = A.eq singleType previousStatus (liftInt32 scan_initialized)
+                            if (whileTp `TupRpair` TupRsingle scalarTypeInt32, statusIsInit)
+                              then do
+                                return $ pair4 done blockId agg (liftInt32 0)
+                              else do
+                                -- In the normal single-pass look-back scan, we do not have to check
+                                -- whether or not the status is inclusive or exclusive, since we
+                                -- can always just use the combine function. This is a bit different
+                                -- with this segmented version: if we do not check wheter the status
+                                -- is inclusive or exclusive, we might add an exclusive prefix that
+                                -- actually had an flag in it, which wouldn't be good
+                                previousAggs <- readArray TypeInt arrTmpAgg blockId
+                                let (prevAgg, _) = A.unpair previousAggs
+                                newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                  then return prevAgg
+                                                  --TODO: Combine both ways
+                                                  else app2 combine prevAgg agg
+                                return $ pair4 (liftInt32 1) blockId newAggregate previousStatus
+                        )
+      res <- if (typeToTuple tp, A.gt singleType s0 (liftInt 0))
         then do
           r <- while (whileTp) 
                 (\(unPair3 -> (done,_,_))         -> A.eq singleType done (liftInt32 0))
                 (\(unPair3 -> (done,blockId,agg)) -> do
-                          previousBlock <- readArray TypeInt arrTmp blockId
-                          let (status, prevAgg) = A.unpair previousBlock
-                          statusIsInit      <- A.eq singleType status (liftInt32 scan_initialized)
-                          statusIsExclusive <- A.eq singleType status (liftInt32 scan_exclusive_known)
-                          statusIsInclusive <- A.eq singleType status (liftInt32 scan_inclusive_known)
-                          let allThreadsInit      = __all_sync (liftWord32 maxBound) statusIsInit
-                          let allThreadsExclusive = __all_sync (liftWord32 maxBound) statusIsExclusive
+                          __threadfence_block
+                          previousStatus <- readArray TypeInt arrTmpStatus blockId
+                          statusIsInclusive <- A.eq singleType previousStatus (liftInt32 scan_inclusive_known)
                           let allThreadsInclusvie = __all_sync (liftWord32 maxBound) statusIsInclusive
-                          if (whileTp, allThreadsInit)
-                            -- The previous block is only initialized, so look again from the beginning
-                            then return $ pair3 done lookAtBlock (undefT tp)
+                          if (whileTp, allThreadsInclusvie)
+                            then do
+                              previousAggs <- readArray TypeInt arrTmpAgg blockId
+                              let (prevAgg, inclusivePrefix) = A.unpair previousAggs
+                              newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
+                                                then return inclusivePrefix
+                                                -- TODO: Combine both ways
+                                                else app2 combine inclusivePrefix agg
+                              return $ pair3 (liftInt32 1) blockId newAggregate
                             else do
-                              if (whileTp, allThreadsExclusive)
-                                -- The previous thread has an exclusive prefix. Add that exclusive prefix to our running
-                                -- prefix. If we don't have a current prefix, then set that. Also check if we can actually
-                                -- look back another block. If not, look again from the beginning
+                              if (whileTp, A.gt singleType blockId (liftInt 0))
                                 then do
-                                  -- Can we look back another block?
-                                  if (whileTp, A.gt singleType blockId (liftInt 0))
-                                    then do
-                                      -- Make sure the previous aggregate is not `undef`, as we init on that
-                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                        then return prevAgg
-                                                        -- TODO: Both combine ways
-                                                        else app2 combine prevAgg agg
-                                      prevBlock <- A.sub numType blockId (liftInt 1)
-                                      return $ pair3 done prevBlock newAggregate
-                                    -- Cannot look back, so reset
-                                    else return $ pair3 done lookAtBlock (undefT tp)
-                                -- Not exclusive, so 2 possibilities left: inclusive or non-synced threads
-                                else do
-                                  if (whileTp, allThreadsInclusvie)
-                                    -- We have an inclusive prefix, add it and stop
-                                    then do
-                                      -- Make sure no undefined behaviour happends due to `agg` being undef
-                                      newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
-                                                        then return prevAgg
-                                                        -- TODO: Both combine ways
-                                                        else app2 combine prevAgg agg
-                                      return $ pair3 (liftInt32 1) blockId newAggregate
-                                    -- If threads do not agree with what status they have, just reset from the beginning
-                                    else return $ pair3 done lookAtBlock (undefT tp)
+                                  waitR <- waitForAvailible $ pair4 done blockId agg (liftInt32 0)
+                                  let (_, _, newAggregate, statusFound) = unPair4 waitR
+                                  prevBlock <- A.sub numType blockId (liftInt 1)
+                                  newDone <- if (TupRsingle scalarTypeInt32, A.eq singleType statusFound (liftInt32 scan_inclusive_known))
+                                    then return $ liftInt32 1
+                                    else return $ liftInt32 0
+                                  return $ pair3 newDone prevBlock newAggregate
+                                else return $ pair3 done lookAtBlock (undefT tp)
                 )
                 (pair3 (liftInt32 0) lookAtBlock (undefT tp))
           -- We're done, so unpack the value and find out what aggregate we have to add
           let (_, _, aggregateToAdd) = unPair3 r
           -- Add the aggregate until we hit the first flag
-          if (tp, A.lt singleType tid (A.snd x2))
-            then do
-              case dir of
-                LeftToRight -> app2 combine aggregateToAdd (A.fst x2)
-                RightToLeft -> app2 combine (A.fst x2) aggregateToAdd
-            else do
-              return $ A.fst x2
-        else return $ A.fst x2
+          let combine' = \x index -> if (tp `TupRpair` TupRsingle scalarTypeInt, flip (A.lt singleType) (A.snd blockRes) =<< A.add numType index =<< A.mul numType tid (liftInt32 $ P.fromIntegral elementsPerThread))
+                                then do
+                                  res <- case dir of
+                                    LeftToRight -> app2 combine aggregateToAdd x
+                                    RightToLeft -> app2 combine x aggregateToAdd
+                                  return $ A.pair res (liftInt 0)
+                                else do
+                                  return $ A.pair x (liftInt 1)
+          applyToTupleZip combine' tp (A.fst blockRes) $ pairGrouped (liftInt32 0, liftInt32 1, liftInt32 2, liftInt32 3, liftInt32 4, liftInt32 5, liftInt32 6)
+        else return $ A.fst blockRes
 
-      writeArray TypeInt arrOut j0 res
       -- If we only set an exclusive status, we now need to set the inclusive status.
       when (A.eq singleType status (liftInt32 scan_exclusive_known)) $
-        when (A.eq singleType tid last) $
-          writeArray TypeInt arrTmp s0 (A.pair (liftInt32 scan_inclusive_known) res)
-
+        when (A.eq singleType tid last) $ do
+          writeArray TypeInt arrTmpAgg s0 (A.pair (lastTuple $ A.fst blockRes) (lastTuple res))
+          __threadfence_grid
+          writeArray TypeInt arrTmpStatus s0 (liftInt32 scan_inclusive_known)
+      
+      let (res1, res2, res3, res4, res5, res6, res7) = unpairGrouped res
+      let writeArray' = flip $ writeArray TypeInt arrOut
+      writeArray' res1 =<< (indexFunc j0 0)
+      writeArray' res2 =<< (indexFunc j0 1)
+      writeArray' res3 =<< (indexFunc j0 2)
+      writeArray' res4 =<< (indexFunc j0 3)
+      writeArray' res5 =<< (indexFunc j0 4)
+      writeArray' res6 =<< (indexFunc j0 5)
+      writeArray' res7 =<< (indexFunc j0 6)
 
     return_
 
@@ -391,9 +494,9 @@ segscanBlock
     -> IntegralType i
     -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
     -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
-    -> Operands e                                   -- ^ calling thread's input element
-    -> Operands i
-    -> CodeGen PTX (Operands (e, Int32))
+    -> OperandsGrouped e                                   -- ^ calling thread's input element
+    -> OperandsGrouped i
+    -> CodeGen PTX (OperandsGroupedS e)
 segscanBlock dir dev
   | canShfl dev = segscanBlockShfl dir dev -- shfl instruction available in compute >= 3.0
  -- | otherwise   = segscanBlockSMem dir dev -- equivalent, slightly slower version
@@ -559,26 +662,26 @@ segscanBlockShfl
     -> IntegralType i
     -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
     -> Maybe (Operands Int32)                       -- ^ number of valid elements (may be less than block size)
-    -> Operands e                                   -- ^ calling thread's input element
-    -> Operands i
-    -> CodeGen PTX (Operands (e, Int32))
+    -> OperandsGrouped e                                   -- ^ calling thread's input element
+    -> OperandsGrouped i
+    -> CodeGen PTX (OperandsGroupedS e)
 segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpPrefix) nope
   where
     int32 :: Integral a => a -> Operands Int32
     int32 = liftInt32 . P.fromIntegral
 
     -- Step 1: Scan in every warp
-    warpScan :: Operands e -> CodeGen PTX (Operands e)
+    warpScan :: OperandsGrouped e -> CodeGen PTX (OperandsGrouped e)
     warpScan e = do 
-      fFlag <- A.fromIntegral intTy numType nflag
-      segscanWarpShfl dir dev tp combine e fFlag
+      fFlags <- applyToTuple (\x -> A.fromIntegral intTy numType x) nflag
+      segscanWarpShfl dir dev tp combine e fFlags
 
     -- Step 2: Collect the aggregate results of each warp to compute the prefix
     -- values for each warp and combine with the partial result to compute each
     -- thread's final value.
-    warpPrefix :: Operands e -> CodeGen PTX (Operands (e, Int32))
+    warpPrefix :: OperandsGrouped e -> CodeGen PTX (OperandsGroupedS e)
     warpPrefix input = do
-      fFlag <- A.fromIntegral intTy numType nflag
+      fFlags <- applyToTuple (\x -> A.fromIntegral intTy numType x) nflag
       -- Allocate #warps elements of shared memory
       bd    <- blockDim
       warps <- A.quot integralType bd (int32 (CUDA.warpSize dev))
@@ -590,7 +693,7 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       wid   <- warpId
       lane  <- laneId
       when (A.eq singleType lane (int32 $ CUDA.warpSize dev - 1)) $ do
-        writeArray TypeInt32 smem wid input
+        writeArray TypeInt32 smem wid (lastTuple input)
       
       -- We want to find out for each warp and block, at which index the first reset
       -- happens due to a flag. This is because after this flag, we should
@@ -624,16 +727,50 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
       ptr <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData sflags))) [op integralType wid]
       -- As well as a pointer for the complete block
       ptrBlock <- instr' $ GetElementPtr (asPtr defaultAddrSpace (op integralType (irArrayData blockHasFlag))) [op integralType (liftInt 0)]
-      when (A.gt singleType fFlag (liftInt32 0)) $ do
-        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType lane) (CrossThread, AcquireRelease)
-        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tid) (CrossThread, AcquireRelease)
+      -- TODO: Make better
+      let (f1, f2, f3, f4, f5, f6, f7) = unpairGrouped fFlags
+      when (A.gt singleType f1 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 0) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 0) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f2 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 1) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 1) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f3 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 2) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 2) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f4 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 3) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 3) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f5 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 4) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 4) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f6 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 5) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 5) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
+      when (A.gt singleType f7 (liftInt32 0)) $ do
+        laneId <- A.add numType (liftInt32 6) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane
+        tidId <- A.add numType (liftInt32 6) =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) tid
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptr (op integralType laneId) (CrossThread, AcquireRelease)
+        void . instr' $ AtomicRMW (IntegralNumType TypeInt32) NonVolatile RMW.Min ptrBlock (op integralType tidId) (CrossThread, AcquireRelease)
 
       -- Wait for each warp to finish its atomic operations and share that info
       __syncthreads
 
       -- Compute the prefix value for this warp and add to the partial result.
       -- This step is not required for the first warp, which has no carry-in.
-      newVal <- if (tp, A.eq singleType wid (liftInt32 0))
+      newVal <- if (typeToTuple tp, A.eq singleType wid (liftInt32 0))
         then return input
         else do
           -- Every thread sequentially scans the warp aggregates to compute
@@ -663,13 +800,16 @@ segscanBlockShfl dir dev tp intTy combine nelem nope nflag = (warpScan >=> warpP
           -- This should happen for all lanes before the first flag, because after the first flag
           -- the prefix doesn't matter anymore
           sflagel <- readArray TypeInt32 sflags wid
-          if (tp, A.lt singleType lane sflagel)
-            then do
-              case dir of
-                LeftToRight -> app2 combine prefix input
-                RightToLeft -> app2 combine input prefix
-            else 
-              return input
+          let combineF = \input index ->
+                          if (tp `TupRpair` TupRsingle scalarTypeInt, flip (A.lt singleType) sflagel =<< A.add numType index =<< A.mul numType (liftInt32 $ P.fromIntegral elementsPerThread) lane)
+                            then do
+                              combined <- case dir of
+                                LeftToRight -> app2 combine prefix input
+                                RightToLeft -> app2 combine input prefix
+                              return $ A.pair combined (liftInt 0)
+                            else 
+                              return $ A.pair input (liftInt 1)
+          applyToTupleZip combineF tp input $ pairGrouped (liftInt32 0, liftInt32 1, liftInt32 2, liftInt32 3, liftInt32 4, liftInt32 5, liftInt32 6)
 
       blockHasFlagVal <- readArray TypeInt32 blockHasFlag (liftInt32 0)
       blockHasFlag' <- A.neq singleType blockHasFlagVal (liftInt32 maxBound)
@@ -681,12 +821,13 @@ segscanWarpShfl
     -> DeviceProperties                             -- ^ properties of the target device
     -> TypeR e
     -> IRFun2 PTX aenv (e -> e -> e)                -- ^ combination function
-    -> Operands e                                   -- ^ calling thread's input element
-    -> Operands Int
-    -> CodeGen PTX (Operands e)
+    -> OperandsGrouped e                                   -- ^ calling thread's input element
+    -> OperandsGrouped Int
+    -> CodeGen PTX (OperandsGrouped e)
 segscanWarpShfl dir dev tp combine el flag = do
-  scan 0 el flag
-  ---
+  newEls <- prescan el flag
+  hasFlag' <- hadflag flag
+  scan 0 (lastTuple newEls) hasFlag' newEls flag
   where
     log2 :: Double -> Double
     log2 = P.logBase 2
@@ -694,10 +835,41 @@ segscanWarpShfl dir dev tp combine el flag = do
     -- Number of steps required to scan warp
     steps = P.floor (log2 (P.fromIntegral (CUDA.warpSize dev)))
 
+    hadflag :: OperandsGrouped Int -> CodeGen PTX (Operands Int)
+    hadflag flags = do
+      let (f1, f2, f3, f4, f5, f6, f7) = unpairGrouped flags
+      f2' <- A.add numType f1 f2
+      f3' <- A.add numType f2' f3
+      f4' <- A.add numType f3' f4
+      f5' <- A.add numType f4' f5
+      f6' <- A.add numType f5' f6
+      f7' <- A.add numType f6' f7
+      return f7'
+
+    -- TODO: Scan both ways
+    prescan :: OperandsGrouped e -> OperandsGrouped Int -> CodeGen PTX (OperandsGrouped e)
+    prescan els flags = do
+      let combine' = \x1 x2 flag -> if (tp, A.lte singleType flag (liftInt 0))
+                                   then do
+                                     case dir of
+                                       LeftToRight -> app2 combine x1 x2
+                                       RightToLeft -> app2 combine x2 x1
+                                    else
+                                      return x2
+      let (x1, x2, x3, x4, x5, x6, x7) = unpairGrouped els
+      let (f1, f2, f3, f4, f5, f6, f7) = unpairGrouped flags
+      x2' <- combine' x1 x2 f2
+      x3' <- combine' x2' x3 f3
+      x4' <- combine' x3' x4 f4
+      x5' <- combine' x4' x5 f5
+      x6' <- combine' x5' x6 f6
+      x7' <- combine' x6' x7 f7
+      return $ pairGrouped (x1, x2', x3', x4', x5', x6', x7')
+
     -- Unfold the scan as a recursive code generation function
-    scan :: Int -> Operands e -> Operands Int -> CodeGen PTX (Operands e)
-    scan step x f
-      | step >= steps = return x
+    scan :: Int -> Operands e -> Operands Int -> OperandsGrouped e -> OperandsGrouped Int -> CodeGen PTX (OperandsGrouped e)
+    scan step x f els flags
+      | step >= steps = return els
       | otherwise     = do
           let offset = 1 `P.shiftL` step
 
@@ -706,28 +878,30 @@ segscanWarpShfl dir dev tp combine el flag = do
           g    <- __shfl_up (TupRsingle scalarTypeInt) f (liftWord32 offset)
           lane <- laneId
 
-          f' <- do 
-            if ((TupRsingle scalarTypeInt), A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
+          let updateFlag = \f g -> if ((TupRsingle scalarTypeInt), A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
                 then do
                   A.add numType f g
                 else
                   return f
 
           -- update partial result if in range
-          x'   <- if (tp, A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
-                    then do
-                      if (tp, A.lte singleType f (liftInt 0))
-                        then do
-                          case dir of
-                            LeftToRight -> app2 combine y x
-                            RightToLeft -> app2 combine x y
-                        else
-                          return x
+          let updateEl = \x y f -> if (tp `TupRpair` TupRsingle scalarTypeInt, A.gte singleType lane (liftInt32 . P.fromIntegral $ offset))
+              then do
+                if (tp `TupRpair` TupRsingle scalarTypeInt, A.lte singleType f (liftInt 0))
+                  then do
+                    combined <- case dir of
+                                  LeftToRight -> app2 combine y x
+                                  RightToLeft -> app2 combine x y
+                    return $ A.pair combined f
+                  else
+                    return $ A.pair x f
+              else
+                return $ A.pair x f
 
-                    else
-                      return x
-
-          scan (step+1) x' f'
+          newTuple <- applyToTupleZip (\x f -> updateEl x y f) tp els flags
+          newFlags <- applyToTuple (\f -> updateFlag f g) flags
+          hasflag <- hadflag newFlags
+          scan (step+1) (lastTuple newTuple) hasflag newTuple newFlags
 
 -- Utilities
 -- ---------
