@@ -239,14 +239,13 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
     inf <- A.mul numType (liftInt elementsPerThread) =<< A.mul numType s0 bd'
 
     -- index i0 is the index this thread will read from
-    -- TODO: Right-to-left
     i0 <- case dir of
             LeftToRight -> A.add numType inf =<< A.mul numType (liftInt elementsPerThread) tid'
             RightToLeft -> do x <- A.sub numType sz inf
-                              y <- A.sub numType x tid'
+                              y <- A.sub numType x =<< A.mul numType (liftInt elementsPerThread) tid'
                               z <- A.sub numType y (liftInt 1)
                               return z
-    
+
     -- index j* is the index that we write to. Recall that for exclusive scans
     -- the output array is one larger than the input; the initial element will
     -- be written into this spot by thread 0 of the first thread block.
@@ -359,8 +358,9 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
                                 let (prevAgg, _) = A.unpair previousAggs
                                 newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
                                                   then return prevAgg
-                                                  --TODO: Combine both ways
-                                                  else app2 combine prevAgg agg
+                                                  else case dir of
+                                                    LeftToRight -> app2 combine prevAgg agg
+                                                    RightToLeft -> app2 combine agg prevAgg
                                 return $ pair4 (liftInt32 1) blockId newAggregate previousStatus
                         )
       res <- if (typeToTuple tp, A.gt singleType s0 (liftInt 0))
@@ -378,8 +378,9 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
                               let (prevAgg, inclusivePrefix) = A.unpair previousAggs
                               newAggregate <- if (tp, A.eq singleType blockId lookAtBlock)
                                                 then return inclusivePrefix
-                                                -- TODO: Combine both ways
-                                                else app2 combine inclusivePrefix agg
+                                                else case dir of 
+                                                  LeftToRight -> app2 combine inclusivePrefix agg
+                                                  RightToLeft -> app2 combine agg inclusivePrefix
                               return $ pair3 (liftInt32 1) blockId newAggregate
                             else do
                               if (whileTp, A.gt singleType blockId (liftInt 0))
@@ -846,7 +847,6 @@ segscanWarpShfl dir dev tp combine el flag = do
       f7' <- A.add numType f6' f7
       return f7'
 
-    -- TODO: Scan both ways
     prescan :: OperandsGrouped e -> OperandsGrouped Int -> CodeGen PTX (OperandsGrouped e)
     prescan els flags = do
       let combine' = \x1 x2 flag -> if (tp, A.lte singleType flag (liftInt 0))
