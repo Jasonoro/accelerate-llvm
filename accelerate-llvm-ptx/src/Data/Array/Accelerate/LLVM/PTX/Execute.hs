@@ -605,10 +605,10 @@ segscanOp
     -> Delayed (Array (sh, Int) e)
     -> Delayed (Segments i)
     -> Par PTX (Future (Array (sh, Int) e))
-segscanOp intTp repr exe gamma aenv input@(delayedShape -> (sz, n)) seg =
+segscanOp intTp repr exe gamma aenv input@(delayedShape -> (sz, n)) seg@(delayedShape -> (_, m)) =
   case n of
     0 -> generateOp repr exe gamma aenv (sz, 1)
-    _ -> segscanCore intTp repr exe gamma aenv (n+1) input seg
+    _ -> segscanCore intTp repr exe gamma aenv ((n `min` m) + 1) input seg
 
 {-# INLINE segscanCore #-}
 segscanCore
@@ -702,10 +702,10 @@ segscan1Op
     -> Delayed (Array (sh, Int) e)
     -> Delayed (Segments i)
     -> Par PTX (Future (Array (sh, Int) e))
-segscan1Op intTp repr exe gamma aenv input@(delayedShape -> sh@(_, n)) seg =
+segscan1Op intTp repr exe gamma aenv input@(delayedShape -> sh@(_, n)) seg@(delayedShape -> (_, m)) =
   case n of
     0 -> newFull =<< allocateRemote repr sh
-    _ -> segscanCore intTp repr exe gamma aenv n input seg
+    _ -> segscanCore intTp repr exe gamma aenv (n `min` m) input seg
 
 {-# INLINE segscan'Op #-}
 segscan'Op
