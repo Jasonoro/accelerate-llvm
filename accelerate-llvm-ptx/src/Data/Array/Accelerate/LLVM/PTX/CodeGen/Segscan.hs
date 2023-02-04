@@ -93,7 +93,8 @@ mkSegscan uid aenv repr intTy dir combine seed arr seg
 
   where
     codeScan = case repr of
-      ArrayR (ShapeRsnoc ShapeRz) tp -> [ mkSegscanAll dir uid aenv tp   intTy combine seed arr seg
+      ArrayR (ShapeRsnoc ShapeRz) tp -> [ mkSegscanPrep dir uid aenv tp   intTy combine seed arr seg,
+                                          mkSegscanAll dir uid aenv tp   intTy combine seed arr seg
                                         ]
       _                              -> [ undefined
                                         ]
@@ -170,6 +171,46 @@ typeToTuple tp = tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `TupRpair` tp `Tup
 lastTuple :: OperandsGrouped e -> Operands e
 lastTuple t = last
   where (_, _, _, _, _, _, last) = unpairGrouped t
+
+
+mkSegscanPrep
+    :: forall aenv e i.
+       Direction
+    -> UID
+    -> Gamma aenv
+    -> TypeR e
+    -> IntegralType i
+    -> IRFun2 PTX aenv (e -> e -> e) -- ^ combination function
+    -> MIRExp PTX aenv e             -- ^ seed element for exclusive scan
+    -> MIRDelayed PTX aenv (Vector e) -- ^ input data
+    -> MIRDelayed PTX aenv (Segments i) -- ^ head flags
+    -> CodeGen PTX (IROpenAcc PTX aenv (Vector e))
+mkSegscanPrep dir uid aenv tp intTy combine mseed marr mseg = do
+  dev <- liftCodeGen $ gets ptxDeviceProperties
+  let
+    (arrBlockId, paramBlockId) = mutableArray (ArrayR dim1 (TupRsingle scalarTypeInt)) "blockIdArr"
+    (arrTmpStatus, paramTmpStatus)  = mutableVolatileArray (ArrayR dim1 tmpStatusTp) "tmpStatus"
+    (arrTmpAgg, paramTmpAgg) = mutableVolatileArray (ArrayR dim1 tmpAggTp) "tmpAgg"
+    (arrOut, paramOut) = mutableArray (ArrayR dim1 tp) "out"
+    (arrIn, paramIn) = delayedArray "in" marr
+    (arrSeg, paramSeg) = delayedArray "seg" mseg
+    end = indexHead (irArrayShape arrTmpStatus)
+    paramEnv = envParam aenv
+    config = launchConfigNoMaxBlocks dev (CUDA.incWarp dev) (\_ -> 0) const [|| const ||] elementsPerThread
+    tmpStatusTp = TupRsingle scalarTypeInt32
+    tmpAggTp = tp `TupRpair` tp
+  makeOpenAccWith config uid "segscanPrep" (paramBlockId ++ paramTmpStatus ++ paramTmpAgg ++ paramOut ++ paramIn ++ paramSeg ++ paramEnv) $ do
+    tid <- threadIdx
+    bid <- blockIdx
+    bid' <- int bid
+    bd <- blockDim
+    last <- A.sub numType bd (liftInt32 1)
+    when (A.eq singleType tid last) $ do
+      writeArray TypeInt arrTmpAgg bid' (A.pair (undefT tp) (undefT tp))
+      __threadfence_grid
+      writeArray TypeInt arrTmpStatus bid' (liftInt32 scan_initialized)
+    return_
+
 
 mkSegscanAll
     :: forall aenv e i.
@@ -260,6 +301,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
                     LeftToRight -> A.lt  singleType i sz
                     RightToLeft -> A.gte singleType i (liftInt 0)
 
+
     when (valid i0) $ do
       let indexFunc = \x y -> case dir of
                           LeftToRight -> A.add numType x (liftInt y)
@@ -271,6 +313,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
       x4 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 4)
       x5 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 5)
       x6 <- app1 (delayedLinearIndex arrIn) =<< (indexFunc i0 6)
+      -- TODO: Should this really be done for multiple elements? I think this should only be applied for element 0
       let seedF = \x -> case mseed of
                               Nothing   -> return x
                               Just seed ->
@@ -311,17 +354,6 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
                   then return (liftInt32 scan_inclusive_known)
                   else return (liftInt32 scan_exclusive_known)
 
-      -- Function to deconstruct the tuple
-      let unPair3 e = let (e', z) = A.unpair e
-                          (x, y)  = A.unpair e'
-                          in (x, y, z)
-      let pair3 x y z = A.pair (A.pair x y) z
-
-      let unPair4 e = let (e', y, z) = unPair3 e
-                          (w, x) = A.unpair e'
-                          in (w, x, y, z)
-      let pair4 w x y z = A.pair (pair3 w x y) z
-      
       -- The last thread also writes its result---the aggregate for this
       -- thread block, and it's corresponding status---to the temporary array. This is only
       -- necessary for full blocks in a multi-block scan; the final
@@ -334,12 +366,23 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
       
       __syncthreads
 
+      -- Function to deconstruct the tuple
+      let unPair3 e = let (e', z) = A.unpair e
+                          (x, y)  = A.unpair e'
+                          in (x, y, z)
+      let pair3 x y z = A.pair (A.pair x y) z
+
+      let unPair4 e = let (e', y, z) = unPair3 e
+                          (w, x) = A.unpair e'
+                          in (w, x, y, z)
+      let pair4 w x y z = A.pair (pair3 w x y) z
+      
       -- We now need to incorporate the previous value up until our first flag. First, we calculate the prefix
       -- using the decoupled look-back algorithm.
       let whileTp = TupRsingle scalarTypeInt32 `TupRpair` TupRsingle scalarTypeInt `TupRpair` tp
       -- The block we start looking back to, which would be the (blockId - 1)
       lookAtBlock <- A.sub numType s0 (liftInt 1)
-      let waitForAvailible = while (whileTp `TupRpair` TupRsingle scalarTypeInt32)
+      let waitForAvailable = while (whileTp `TupRpair` TupRsingle scalarTypeInt32)
                         (\(unPair4 -> (done, _, _, _)) -> A.eq singleType done (liftInt32 0))
                         (\(unPair4 -> (done,blockId,agg,_)) -> do
                             previousStatus <- readArray TypeInt arrTmpStatus blockId
@@ -385,7 +428,7 @@ mkSegscanAll dir uid aenv tp intTy combine mseed marr mseg = do
                             else do
                               if (whileTp, A.gt singleType blockId (liftInt 0))
                                 then do
-                                  waitR <- waitForAvailible $ pair4 done blockId agg (liftInt32 0)
+                                  waitR <- waitForAvailable $ pair4 done blockId agg (liftInt32 0)
                                   let (_, _, newAggregate, statusFound) = unPair4 waitR
                                   prevBlock <- A.sub numType blockId (liftInt 1)
                                   newDone <- if (TupRsingle scalarTypeInt32, A.eq singleType statusFound (liftInt32 scan_inclusive_known))

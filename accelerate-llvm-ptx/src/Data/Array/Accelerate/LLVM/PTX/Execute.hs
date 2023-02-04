@@ -642,8 +642,9 @@ segscanAllOp
     -> Par PTX (Future (Vector e))
 segscanAllOp intTp tp exe gamma aenv m input@(delayedShape -> ((), n)) seg@(delayedShape -> ((), ss)) =
   withExecutable exe $ \ptxExecutable -> do
-    let k1 = ptxExecutable !# "segscanAll"
-    let amountOfBlocks = n `multipleOf` (kernelThreadBlockSize k1)
+    let k1 = ptxExecutable !# "segscanPrep"
+    let k2 = ptxExecutable !# "segscanAll"
+    let amountOfBlocks = n `multipleOf` (kernelThreadBlockSize k2)
     -- Representation of the input / output arrays
     let repr =  ArrayR dim1 tp
     -- Representation of the segments array
@@ -665,6 +666,7 @@ segscanAllOp intTp tp exe gamma aenv m input@(delayedShape -> ((), n)) seg@(dela
     -- BlockID, Tmp, Out, In, Segments
     let paramsR = TupRsingle (ParamRarray reprBlockId) `TupRpair` TupRsingle (ParamRarray reprTmpStatus) `TupRpair` TupRsingle (ParamRarray reprTmpAgg) `TupRpair` TupRsingle (ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray repr) `TupRpair` TupRsingle (ParamRmaybe $ ParamRarray reprSeg)
     executeOp k1 gamma aenv dim1 ((), amountOfBlocks) paramsR (((((blockId, tmpStatus), tmpAgg), result), manifest input), manifest seg)
+    executeOp k2 gamma aenv dim1 ((), amountOfBlocks) paramsR (((((blockId, tmpStatus), tmpAgg), result), manifest input), manifest seg)
     put future result
     return future
 
